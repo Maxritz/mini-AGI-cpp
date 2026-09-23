@@ -19,3 +19,9 @@ runs/corpus_index.json
 # secrets
 .env
 .env.*
+
+# C++ build output
+build/
+
+# local knowledge-graph analysis output
+graphify-out/

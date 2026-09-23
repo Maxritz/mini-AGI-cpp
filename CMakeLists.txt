@@ -1,0 +1,35 @@
+cmake_minimum_required(VERSION 3.15)
+project(minimagi LANGUAGES CXX)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+if(MSVC)
+    add_compile_options(/W4 /EHsc /O2)
+else()
+    add_compile_options(-Wall -Wextra -O2)
+endif()
+enable_testing()
+
+file(GLOB CORE_SRCS CONFIGURE_DEPENDS src/*.cpp)
+add_library(minimagi STATIC ${CORE_SRCS})
+target_include_directories(minimagi PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+add_executable(test_mininpz tests/test_mininpz.cpp)
+target_link_libraries(test_mininpz PRIVATE minimagi)
+add_test(NAME test_mininpz COMMAND test_mininpz)
+
+add_executable(test_tensor tests/test_tensor.cpp)
+target_link_libraries(test_tensor PRIVATE minimagi)
+add_test(NAME test_tensor COMMAND test_tensor)
+
+add_executable(test_config_tokenizer tests/test_config_tokenizer.cpp)
+target_link_libraries(test_config_tokenizer PRIVATE minimagi)
+add_test(NAME test_config_tokenizer COMMAND test_config_tokenizer)
+
+add_executable(test_store tests/test_store.cpp)
+target_link_libraries(test_store PRIVATE minimagi)
+add_test(NAME test_store COMMAND test_store)
+
+add_executable(test_model tests/test_model.cpp)
+target_link_libraries(test_model PRIVATE minimagi)
+add_test(NAME test_model COMMAND test_model)
