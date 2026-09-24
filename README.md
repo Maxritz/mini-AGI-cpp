@@ -500,6 +500,18 @@ The parts the model is built out of:
 
 The corpus: [TinyStories](https://huggingface.co/datasets/roneneldan/TinyStories), [OpenHermes-2.5](https://huggingface.co/datasets/teknium/OpenHermes-2.5), [OpenThoughts-114k](https://huggingface.co/datasets/open-thoughts/OpenThoughts-114k) and [the Lichess open database](https://database.lichess.org/). Wikipedia and the source-code portion come from public dumps and public repositories.
 
+## Training Infrastructure
+
+### HLSL Compute Shaders (`src/shaders/`)
+
+- `dense.hlsl` — Forward pass kernels (matmul, RMSNorm, softmax, RoPE, SwiGLU, attention).
+- `pool.hlsl` — Pooled MLP expert matmul (W1/W3/W2) and scatter-add.
+- `backward.hlsl` — Backward pass gradient kernels (cross-entropy, matmul weight/input gradients, RMSNorm, RoPE inverse, attention, SwiGLU gate derivative, scatter-add gradient). Each shader follows the same 12-binding DSL and push-constant layout as `dense.hlsl`. Entry points are `main_grad_*` functions, auto-routed by `dx12_engine.cpp::load_compute_pso` when the entry name contains `grad_`.
+
+### Optimizer (`src/optimizer.hpp/cpp`)
+
+- `AdamW` class: decoupled weight decay, bias-corrected first/second moments, global gradient clipping (L2 norm). Moment tensors are stored under `<param>_m`/`<param>_v` naming, compatible with `store::save_paged` and `PagedPool::is_moment_key`. `state_dict()`/`load_state_dict()` serialize optimizer state alongside model weights. The optimizer uses `mt::Tensor` directly — no GPU coupling; gradients flow from DX12 readback or CPU autograd.
+
 ## Citation
 
 If you use this project in your research or work, please cite it as:

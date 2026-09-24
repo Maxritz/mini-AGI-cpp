@@ -23,5 +23,14 @@ runs/corpus_index.json
 # C++ build output
 build/
 
+# compiled artifacts
+*.pdb
+e00008.npz
+train.i
+
+# training checkpoints
+trained_model/
+ckpt_step*/
+
 # local knowledge-graph analysis output
 graphify-out/

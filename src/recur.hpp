@@ -86,8 +86,40 @@ public:
   const Config& cfg() const;
   paged::PagedPool* pool();
   const paged::PagedPool* pool() const;
-  void set_pool(paged::PagedPool* p);            // used by minagi::load
- private:
+    void set_pool(paged::PagedPool* p);            // used by minagi::load
+
+   // Recurent/dense block weights. Blocks_[0] = prelude (dense SwiGLU MLP),
+   // blocks_[1..n_prelude+n_recur+n_coda-1] = recurrent sites (pooled MLP).
+   struct Block {
+    mt::Tensor ln1;                    // [d]
+    mt::Tensor qkv;                    // [3d, d]
+    mt::Tensor proj;                   // [d, d]
+    mt::Tensor ln2;                    // [d]
+    mt::Tensor w1, w3, w2;             // dense SwiGLU (prelude.0.*)
+    mt::Tensor router;                 // [n_experts, d] (recur.*.mlp.router.weight)
+    mt::Tensor depth_emb;              // [d]       (recur.*.mlp.depth_emb)
+  };
+
+   // Random initialization matching minagi/recur.py RecurCoder.__init__.
+   void random_init(unsigned seed);
+
+   // Parameter access by python-style key (e.g. "tok_emb.weight", "prelude.0.ln1.weight").
+   // Returns nullptr if the key is not a dense trunk parameter.
+    mt::Tensor* get_param(const std::string& name);
+    const mt::Tensor* get_param(const std::string& name) const;
+
+    // Accessors for weight tensors (used by train.cpp / backward.cpp)
+    const mt::Tensor& tok_emb() const { return tok_emb_; }
+    mt::Tensor& tok_emb() { return tok_emb_; }
+    const mt::Tensor& adapter_w() const { return adapter_w_; }
+    const mt::Tensor& ln_f_w() const { return ln_f_w_; }
+    const mt::Tensor& halt_w() const { return halt_w_; }
+    const mt::Tensor& halt_b() const { return halt_b_; }
+    const mt::Tensor& rope_cos() const { return rope_cos_; }
+    const mt::Tensor& rope_sin() const { return rope_sin_; }
+    std::vector<Block>& blocks() { return blocks_; }
+
+  private:
   Config cfg_;
   bool loaded_ = false;
   paged::PagedPool* pool_ = nullptr; // external; set by load_weights
@@ -98,16 +130,6 @@ public:
   mt::Tensor ln_f_w_;                  // [d_model]
   mt::Tensor halt_w_;                  // [1, d_model]
   mt::Tensor halt_b_;                  // [1]
-  struct Block {
-    mt::Tensor ln1;                    // [d]
-    mt::Tensor qkv;                    // [3d, d]
-    mt::Tensor proj;                   // [d, d]
-    mt::Tensor ln2;                    // [d]
-    // exactly one of the two MLP kinds is used per block kind:
-    mt::Tensor w1, w3, w2;             // dense SwiGLU (prelude.0.*)
-    mt::Tensor router;                 // [n_experts, d] (recur.*.mlp.router.weight)
-    mt::Tensor depth_emb;              // [d]       (recur.*.mlp.depth_emb)
-  };
   // blocks_[0] = prelude, blocks_[1..n_prelude+n_recur+n_coda-1] = recurrent sites.
   std::vector<Block> blocks_;
   // cached rope tables (built once, reused across forwards).

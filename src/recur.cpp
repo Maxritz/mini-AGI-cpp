@@ -6,6 +6,7 @@
 // cache positions, which model.cpp's single-stack forward does not do.
 #include "recur.hpp"
 #include "mininpz.hpp"
+#include "init.hpp"
 #include <cmath>
 #include <cstring>
 #include <algorithm>
@@ -34,6 +35,9 @@ mt::Tensor zeros2d(int64_t r, int64_t c) {
     s.d[1] = c;
     return mt::make(s, mt::DType::FP32, 0.0f);
 }
+
+mt::Shape shape1(int64_t d0) { mt::Shape s; s.rank = 1; s.d[0] = d0; return s; }
+mt::Shape shape2(int64_t r0, int64_t r1) { mt::Shape s; s.rank = 2; s.d[0] = r0; s.d[1] = r1; return s; }
 
 mt::Tensor make_rank0() {
     mt::Shape s;
@@ -321,6 +325,65 @@ const Config& Coder::cfg() const { return cfg_; }
 minagi::paged::PagedPool* Coder::pool() { return pool_; }
 const minagi::paged::PagedPool* Coder::pool() const { return pool_; }
 void Coder::set_pool(minagi::paged::PagedPool* p) { pool_ = p; }
+
+void Coder::random_init(unsigned seed) {
+    PcgRng rng(static_cast<uint64_t>(seed));
+    const int d = cfg_.d_model;
+    const int V = cfg_.vocab_size;
+    const int dff = cfg_.d_ff;
+    const int n_blocks = cfg_.n_prelude + cfg_.n_recur + cfg_.n_coda;
+
+    tok_emb_ = init_normal(shape2(V, d), rng, 0.0f, 0.02f);
+    adapter_w_ = init_eye(d, 2 * d);
+    ln_f_w_ = init_const(shape1(d), 1.0f);
+    halt_w_ = init_normal(shape2(1, d), rng, 0.0f, 0.01f);
+    halt_b_ = init_const(shape1(1), -2.0f);
+
+    blocks_.resize(static_cast<size_t>(n_blocks));
+    for (int i = 0; i < n_blocks; ++i) {
+        auto& b = blocks_[i];
+        b.ln1 = init_const(shape1(d), 1.0f);
+        b.qkv = init_normal(shape2(3 * d, d), rng, 0.0f, 0.02f / std::sqrt(static_cast<float>(d)));
+        b.proj = init_const(shape2(d, d), 0.0f);
+        b.ln2 = init_const(shape1(d), 1.0f);
+        b.w1 = init_normal(shape2(dff, d), rng, 0.0f, 0.02f / std::sqrt(static_cast<float>(dff)));
+        b.w3 = init_normal(shape2(dff, d), rng, 0.0f, 0.02f / std::sqrt(static_cast<float>(dff)));
+        b.w2 = init_normal(shape2(d, dff), rng, 0.0f, 0.02f / std::sqrt(static_cast<float>(dff)));
+        b.router = init_const(shape2(cfg_.pool_experts, d), 0.0f);
+        b.depth_emb = init_const(shape1(d), 0.0f);
+    }
+    loaded_ = true;
+}
+
+mt::Tensor* Coder::get_param(const std::string& name) {
+    if (name == "tok_emb.weight") return &tok_emb_;
+    if (name == "ln_f.weight") return &ln_f_w_;
+    if (name == "halt.weight") return &halt_w_;
+    if (name == "halt.bias") return &halt_b_;
+    if (name == "adapter.weight") return &adapter_w_;
+
+    for (int i = 0; i < static_cast<int>(blocks_.size()); ++i) {
+        const auto& b = blocks_[i];
+        std::string prefix;
+        if (i == 0) prefix = "prelude.0.";
+        else prefix = "recur." + std::to_string(i - cfg_.n_prelude) + ".";
+
+        if (name == prefix + "ln1.weight") return const_cast<mt::Tensor*>(&b.ln1);
+        if (name == prefix + "attn.qkv.weight") return const_cast<mt::Tensor*>(&b.qkv);
+        if (name == prefix + "attn.proj.weight") return const_cast<mt::Tensor*>(&b.proj);
+        if (name == prefix + "ln2.weight") return const_cast<mt::Tensor*>(&b.ln2);
+        if (name == prefix + "mlp.w1.weight") return const_cast<mt::Tensor*>(&b.w1);
+        if (name == prefix + "mlp.w3.weight") return const_cast<mt::Tensor*>(&b.w3);
+        if (name == prefix + "mlp.w2.weight") return const_cast<mt::Tensor*>(&b.w2);
+        if (name == prefix + "mlp.router.weight") return const_cast<mt::Tensor*>(&b.router);
+        if (name == prefix + "mlp.depth_emb") return const_cast<mt::Tensor*>(&b.depth_emb);
+    }
+    return nullptr;
+}
+
+const mt::Tensor* Coder::get_param(const std::string& name) const {
+    return const_cast<Coder*>(this)->get_param(name);
+}
 
 int Coder::n_slots() const { return n_slots_; }
 
