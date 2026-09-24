@@ -1,0 +1,213 @@
+{
+ "step": 0,
+ "val": 0.0,
+ "cfg": {
+  "vocab_size": 265,
+  "n_layer": 8,
+  "n_head": 3,
+  "d_model": 24,
+  "block": 1024,
+  "d_ff": 48,
+  "rope_theta": 10000.0,
+  "tie_embeddings": true,
+  "use_pool": true,
+  "pool_experts": 6,
+  "pool_d_ff": 32,
+  "pool_depth": 1,
+  "pool_top_k": 2,
+  "pool_capacity_factor": 1.5,
+  "pool_max": 6,
+  "pool_aux": 0.01,
+  "n_prelude": 1,
+  "n_recur": 2,
+  "n_coda": 0,
+  "max_steps": 5,
+  "min_steps": 1,
+  "train_steps_mean": 0.0,
+  "bptt_window": 4,
+  "ponder_beta": 0.01,
+  "halt_prior": 0.4,
+  "halt_thresh": 0.9,
+  "pool_resident": 3,
+  "pool_ever": [
+   false,
+   false,
+   false,
+   true,
+   true,
+   true
+  ],
+  "pool_since": [
+   0.0,
+   0.0,
+   0.0,
+   1.0,
+   1.0,
+   1.0
+  ]
+ },
+ "telemetry": {
+  "gate": [
+   1.0,
+   1.02,
+   1.04,
+   1.06,
+   1.08,
+   1.1
+  ],
+  "gate_seen": [
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0
+  ],
+  "use": [
+   0.0,
+   0.0,
+   0.0,
+   6451.0,
+   6884.0,
+   7145.0
+  ],
+  "admits": [
+   0.0,
+   0.0,
+   0.0,
+   1.0,
+   1.0,
+   1.0
+  ],
+  "born": [
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0
+  ],
+  "since": [
+   0.0,
+   0.0,
+   0.0,
+   1.0,
+   1.0,
+   1.0
+  ],
+  "last_seen": [
+   0.0,
+   0.0,
+   0.0,
+   4.0,
+   4.0,
+   4.0
+  ],
+  "ever": [
+   false,
+   false,
+   false,
+   true,
+   true,
+   true
+  ],
+  "uid": [
+   0,
+   1,
+   2,
+   3,
+   4,
+   5
+  ],
+  "next_uid": 6,
+  "segments": 4
+ },
+ "n_experts": 6,
+ "d_model": 24,
+ "d_ff": 32,
+ "paged": true,
+ "core_tensors": [
+  "adapter.weight",
+  "halt.bias",
+  "halt.weight",
+  "head.weight",
+  "ln_f.weight",
+  "prelude.0.attn.proj.weight",
+  "prelude.0.attn.qkv.weight",
+  "prelude.0.ln1.weight",
+  "prelude.0.ln2.weight",
+  "prelude.0.mlp.w1.weight",
+  "prelude.0.mlp.w2.weight",
+  "prelude.0.mlp.w3.weight",
+  "recur.0.attn.proj.weight",
+  "recur.0.attn.qkv.weight",
+  "recur.0.ln1.weight",
+  "recur.0.ln2.weight",
+  "recur.1.attn.proj.weight",
+  "recur.1.attn.qkv.weight",
+  "recur.1.ln1.weight",
+  "recur.1.ln2.weight",
+  "tok_emb.weight"
+ ],
+ "router_tensors": [
+  "pool.gate",
+  "pool.segment_router.weight",
+  "recur.0.mlp.depth_emb",
+  "recur.0.mlp.router.weight",
+  "recur.1.mlp.depth_emb",
+  "recur.1.mlp.router.weight"
+ ],
+ "experts": [
+  {
+   "id": 0,
+   "file": "e00000.npz",
+   "bytes": 9946,
+   "params": 2304,
+   "moments": true,
+   "gate": 1.0
+  },
+  {
+   "id": 1,
+   "file": "e00001.npz",
+   "bytes": 9946,
+   "params": 2304,
+   "moments": true,
+   "gate": 1.0199999809265137
+  },
+  {
+   "id": 2,
+   "file": "e00002.npz",
+   "bytes": 9946,
+   "params": 2304,
+   "moments": true,
+   "gate": 1.0399999618530273
+  },
+  {
+   "id": 3,
+   "file": "e00003.npz",
+   "bytes": 9946,
+   "params": 2304,
+   "moments": true,
+   "gate": 1.059999942779541
+  },
+  {
+   "id": 4,
+   "file": "e00004.npz",
+   "bytes": 9946,
+   "params": 2304,
+   "moments": true,
+   "gate": 1.0800000429153442
+  },
+  {
+   "id": 5,
+   "file": "e00005.npz",
+   "bytes": 9946,
+   "params": 2304,
+   "moments": true,
+   "gate": 1.100000023841858
+  }
+ ],
+ "total_bytes": 159352,
+ "read_only": true,
+ "pool_ram": 4
+}

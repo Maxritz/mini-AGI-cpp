@@ -1,0 +1,28 @@
+DX12 smoke test start
+DX12 not available on this machine, using CPU fallback
+gdir="..\\tests\\golden_wavef" wdir="..\\tests\\golden_wavef\\weights" exists=1
+ok dx12_load_weights
+ok dx12_manifest_paged
+ok dx12_manifest_readonly
+ok dx12_load_weights_coder
+ok dx12_slots_size
+Running forward (seg0, 170 tokens)...
+DBG pool n=3 k=2 gsum=6.3 [c=0 exp=5 gate=1.1 log=0.0906949 p=0.359168] [c=1 exp=4 gate=1.08 log=-0.017922 p=0.3222] [c=2 exp=3 gate=1.06 log=-0.0290598 p=0.318632] | idx: 0 1 | wv: 0.57984 0.510702
+DBG poolmlp n=0 r=0: hn2=1.0069 0.00873247 0.526637 | mlp_out=-0.000242313 -0.000112556 0.000167912
+ok dx12_seg0_logits_shape
+ok dx12_logits_bin
+ok dx12_logits_hdr
+dx12 seg0 pos0 gold[0]=0.083194 ours[0]=0.083194 maxdiff=5.96046e-08
+ok dx12_seg0_pos0_logits
+dx12 halt_row pos0 gold=5 ours=5
+ok dx12_halt_row_pos0
+DX12_POOL: shader_dir = ../src/shaders
+DX12_POOL: init failed or PSO compilation failed
+DX12_POOL: matmul_w1w3 PSO failed
+DX12_POOL: silu_mul PSO failed
+DX12_POOL: matmul_w2 PSO failed
+DX12_POOL: scatter PSO failed
+DX12 pool context creation failed
+FAIL dx12_pool_init
+DX12 smoke test done: 11 checks, 1 failures
+1 check(s) FAILED

@@ -4,18 +4,28 @@
 // manifest.json. Port of minagi/store.py (non-paged path).
 #pragma once
 #include "mininpz.hpp"
+#include "tensor.hpp"
 #include <string>
 #include <vector>
 #include <map>
 #include <cstdint>
 #include <cstddef>
 
+namespace minagi::paged { class PagedPool; }
+
 namespace store {
 
 struct Manifest {
     int step = 0;
     double val = -1.0;
-    std::map<std::string, std::string> cfg;
+    std::map<std::string, std::string> cfg;  // original string map (kept for parity)
+    mini::JsonValue cfg_obj;                  // parsed cfg object (typed numbers/bools)
+    mini::JsonValue telemetry;                // section-3 telemetry block (possibly null)
+    bool paged = false;                       // manifest "paged"
+    bool read_only = false;                  // top-level manifest "read_only"
+    int pool_ram = 4;                        // top-level manifest "pool_ram"
+    std::vector<bool> pool_ever;             // cfg.pool_ever (lifecycle snapshot)
+    std::vector<double> pool_since;          // cfg.pool_since
     int n_experts = 0;
     int d_model = 0;
     int d_ff = 0;
@@ -47,6 +57,7 @@ bool is_moment(const std::string& name);
 bool is_optim(const std::string& name);
 int expert_index(const std::string& key);
 std::string expert_leaf(const std::string& key);
+std::string expert_dir(const std::string& dir);  // dir/experts (helpers above use it)
 
 // bf16 packing (fp32 -> int16 bits, RNE)
 std::vector<int16_t> pack_bf16(const std::vector<float>& vals);
@@ -64,6 +75,16 @@ bool save(const std::string& dir,
 bool load(const std::string& dir,
           Manifest& manifest,
           std::map<std::string, mininpz::Array>& state);
+
+// Paged-path save (section 1 _save_paged). pool.flush() first, writes core +
+// router bundles, manifest with pool_resident and pool_max=max(pool_max,entries)
+// and cfg merged with pool_ever/pool_since; per-expert entries mirror the
+// manifest's expert list (moments==true). Atomic writes. Returns false on error.
+bool save_paged(const std::vector<std::pair<std::string, mt::Tensor>>& sd,
+                const minagi::paged::PagedPool& pool,
+                const mini::JsonValue& cfg_obj,
+                const std::string& dir, int step, double val,
+                SaveResult* out);
 
 double best_val(const std::string& dir);
 std::string summarise(const std::string& dir);

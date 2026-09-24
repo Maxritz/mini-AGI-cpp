@@ -112,8 +112,10 @@ const T* Tensor::ptr() const {
 // Explicit instantiations
 template float* Tensor::ptr<float>();
 template bfloat16* Tensor::ptr<bfloat16>();
+template uint16_t* Tensor::ptr<uint16_t>();
 template const float* Tensor::ptr<float>() const;
 template const bfloat16* Tensor::ptr<bfloat16>() const;
+template const uint16_t* Tensor::ptr<uint16_t>() const;
 
 // Factory functions
 Tensor make(const Shape& s, DType dt, float fill) {
