@@ -83,6 +83,16 @@ if(ENABLE_DX12)
     target_compile_definitions(minagi_create PRIVATE NOMINMAX)
 endif()
 
+# ---- Decode (inference) tool ----
+add_executable(minagi_decode tools/decode.cpp)
+target_link_libraries(minagi_decode PRIVATE minimagi)
+
+if(ENABLE_DX12)
+    target_sources(minagi_decode PRIVATE src/dx12_context.cpp src/dx12_engine.cpp)
+    target_link_libraries(minagi_decode PRIVATE d3d12 dxgi d3dcompiler)
+    target_compile_definitions(minagi_decode PRIVATE NOMINMAX)
+endif()
+
 add_executable(test_wavef tests/test_wavef.cpp)
 target_link_libraries(test_wavef PRIVATE minimagi)
 add_test(NAME test_wavef COMMAND test_wavef ..)

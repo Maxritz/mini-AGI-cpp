@@ -193,20 +193,6 @@ mt::Tensor pool_mlp_forward(const Pool& pool, const mt::Tensor& x,
     }
   }
 
-  {
-    static bool pd=false;
-    float gsum=0; for(int i=0;i<gate.shape.d[0];++i) gsum+=gate.ptr<float>()[i];
-    if(!pd && gsum > 0.5){
-      float mx=*std::max_element(logits.begin(),logits.end());
-      double sm=0; for(int i=0;i<n;++i){double e=std::exp(static_cast<double>(logits[i])-mx); sm+=e;}
-      std::cout << "DBG pool n=" << n << " k=" << k << " gsum=" << gsum;
-      for(int c=0;c<n;++c){ std::cout << " [c=" << c << " exp=" << rows[c] << " gate=" << gp[rows[c]] << " log=" << logits[c] << " p=" << (std::exp((static_cast<double>(logits[c])-mx))/sm) << "]"; }
-      std::cout << " | idx:"; for(int i=0;i<k;++i) std::cout << " " << idx[i];
-      std::cout << " | wv:"; for(int i=0;i<k;++i) std::cout << " " << wv[i];
-      std::cout << std::endl; pd=true;
-    }
-  }
-
   // Routing bookkeeping: per-slot pick counts (ALL picks, before any drop).
   std::vector<long long> slot_hits(static_cast<size_t>(n), 0);
   for (size_t j = 0; j < static_cast<size_t>(N) * static_cast<size_t>(k); ++j) {

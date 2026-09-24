@@ -566,19 +566,6 @@ StepOut Coder::forward(const mt::Tensor& idx,
             mt::Tensor mlp_out = pool_mlp_forward(*pool_, hn2, b.router, b.depth_emb,
                                                   cfg_.pool_top_k,
                                                   cfg_.pool_capacity_factor, nullptr);
-            // Debug: print hn2 and mlp_out for the first token of first segment
-            {
-                static bool pd_poolmlp = false;
-                if (!pd_poolmlp && n == 0 && r == 0 && hn2.shape.d[1] >= 3) {
-                    const float* hn2p = hn2.ptr<float>();
-                    const float* mlp_p = mlp_out.ptr<float>();
-                    std::cout << "DBG poolmlp n=" << n << " r=" << r
-                              << ": hn2=" << hn2p[0] << " " << hn2p[1] << " " << hn2p[2]
-                              << " | mlp_out=" << mlp_p[0] << " " << mlp_p[1] << " " << mlp_p[2]
-                              << std::endl;
-                    pd_poolmlp = true;
-                }
-            }
             const float* mp = mlp_out.ptr<float>();
             float* hp = h.ptr<float>();
             for (int64_t i = 0; i < M * d; ++i) {
