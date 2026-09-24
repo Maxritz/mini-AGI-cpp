@@ -73,6 +73,16 @@ add_executable(test_model tests/test_model.cpp)
 target_link_libraries(test_model PRIVATE minimagi)
 add_test(NAME test_model COMMAND test_model)
 
+# ---- Model creation tool ----
+add_executable(minagi_create tools/create.cpp)
+target_link_libraries(minagi_create PRIVATE minimagi)
+
+if(ENABLE_DX12)
+    target_sources(minagi_create PRIVATE src/dx12_context.cpp src/dx12_engine.cpp)
+    target_link_libraries(minagi_create PRIVATE d3d12 dxgi d3dcompiler)
+    target_compile_definitions(minagi_create PRIVATE NOMINMAX)
+endif()
+
 add_executable(test_wavef tests/test_wavef.cpp)
 target_link_libraries(test_wavef PRIVATE minimagi)
 add_test(NAME test_wavef COMMAND test_wavef ..)
