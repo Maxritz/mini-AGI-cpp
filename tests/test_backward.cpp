@@ -391,7 +391,9 @@ int main() {
     // not a measurement. So this case asserts what IS observable: that a free
     // halting head produces a nonzero d_lam, and that the halt weights stay
     // consistent with a finite difference at a scale the instrument supports.
-    // It does not certify halt.weight / halt.bias. STATUS gap #11.
+    // halt.weight/halt.bias are verified by case 2b (cached-lam sweep + sum invariant).
+    // That probe is immune to the float32 forward floor because it re-evaluates the
+    // loss in double while perturbing the cached lam, not a parameter. Gap #11 closed.
     {
         minagi::Config cfg;
         cfg.vocab_size = 7;
@@ -433,7 +435,8 @@ int main() {
         // halt.weight / halt.bias are verified by check_halting_scaling above,
         // NOT by the directional parameter check: perturbing the bias forces a
         // float32 forward whose numeric side is one loss-ulp, while the
-        // gradient itself is 6.3e-6 at M=4. See STATUS.md gap #11.
+        // gradient itself is 6.3e-6 at M=4. See STATUS.md. Gap #11 closed via
+        // the cached-lam batch sweep + P1 sum-consistency invariant.
         const std::vector<std::string> names = {
             "ln_f.weight",
             "tok_emb.weight",
