@@ -138,8 +138,8 @@ DONE P1 src/paged.cpp: assert_slots_valid + slots_valid() defined.
 DONE P1 src/recur.hpp: begin_segment() comment upgraded to REQUIRED.
 DONE P1 STATUS.md: gap #11 rewritten, not deleted - records the float32-floor-vs-real-defect confusion so the next reader doesn't repeat it.
 DONE P1 STATUS.md: added ce_of exp/log typo under bug history #5.
-P1   src/backward.hpp: d_lam_per_step field - could add an invariant: sum_t d_lam[n][t] == dL/d(sum_t lam_n[t]); cheap, float64-free, catches future normalization slips.
-P2   CMakeLists.txt: add a guarded minagi_diag target for ad-hoc probes instead of hand-compiling.
+P1   src/backward.hpp: d_lam_per_step invariant now in test (sum_t d_lam[n][t] == analytic per row, M-sweep catches missing-1/M at rel=1/M).
+P2   CMakeLists.txt: guarded minagi_diag target added (option DIAG_PROBE). Usage: cmake -B build -DDIAG_PROBE=tests/scratch_probe.cpp && cmake --build build --target minagi_diag. Stub removed after verifying build works; target stays no-op by default.
 ```
 
 

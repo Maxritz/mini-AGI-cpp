@@ -103,6 +103,18 @@ target_link_libraries(minagi_decode PRIVATE minimagi)
 add_executable(minagi_gguf_convert tools/gguf_convert.cpp)
 target_link_libraries(minagi_gguf_convert PRIVATE minimagi)
 
+# ---- Guarded diagnostic target (opt-in, not in default test set) ----
+# For ad-hoc probes that link the static lib without editing CMakeLists each time.
+# Enable: cmake -B build -DDIAG_PROBE=tests/scratch_probe.cpp
+# Then:  cmake --build build --target minagi_diag
+option(DIAG_PROBE "Path to an ad-hoc diagnostic probe source (relative to repo root)" "")
+if(DIAG_PROBE)
+    add_executable(minagi_diag ${DIAG_PROBE})
+    target_link_libraries(minagi_diag PRIVATE minimagi)
+endif()
+
+
+
 if(ENABLE_DX12)
     target_sources(minagi_decode PRIVATE src/dx12_context.cpp src/dx12_engine.cpp)
     target_link_libraries(minagi_decode PRIVATE d3d12 dxgi d3dcompiler)
