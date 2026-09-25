@@ -86,6 +86,8 @@ int Dx12ComputeEngine::load_compute_pso(const std::string& entry_point) {
     std::string hlsl_path = shader_dir_ + "/dense.hlsl";
     if (entry_point.find("pool") != std::string::npos) {
         hlsl_path = shader_dir_ + "/pool.hlsl";
+    } else if (entry_point.find("grad_") != std::string::npos) {
+        hlsl_path = shader_dir_ + "/backward.hlsl";
     }
 
     std::vector<uint8_t> bytecode;

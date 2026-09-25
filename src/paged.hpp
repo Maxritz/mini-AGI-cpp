@@ -16,6 +16,7 @@
 #include <utility>
 #include <vector>
 
+namespace minagi { class PcgRng; }  // forward decl (defined in init.hpp)
 namespace minagi::paged {
 
 struct TierCounters {
@@ -138,15 +139,23 @@ public:
   // Wiring required by Coder::load_weights and store::save_paged (the listed
   // surface is read-only, so the directory's values are set here).
   void set_gate(const mt::Tensor& g);
-  void set_segment_router(const mt::Tensor& w);
+   void set_segment_router(const mt::Tensor& w);
+   const mt::Tensor& segment_router() const { return segment_router_; }
   mini::JsonValue telemetry() const;  // section-3 telemetry block
   mini::JsonValue telemetry_json() const;  // alias used by store::save_paged
   void lookup_gate(int eid, double& g) const;  // gate[eid] or 1.0 if unknown
   void emit_manifest_lifecycle(std::map<std::string, mini::JsonValue>& obj) const;
   static bool is_moment_key(const std::string& key);
   static bool is_router_key(const std::string& key);
-  int d_model() const { return d_model_; }
-  int d_ff() const { return d_ff_; }
+   int d_model() const { return d_model_; }
+   int d_ff() const { return d_ff_; }
+
+   // --- Training lifecycle (growth/prune) ---
+   // Grow by k new experts born at birth_gate. Returns new total n_experts.
+   int grow(int k, int step, double birth_gate,
+            float weight_std, minagi::PcgRng& rng, const std::string& experts_dir);
+   // Prune stale experts. Returns number removed.
+   int prune(int step, int survival_steps, int protect);
 
 private:
   void refresh_keys();                  // segments%8==0 (never fires in the golden)

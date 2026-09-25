@@ -6,6 +6,7 @@
 // note; Tier-2 keys/demand/telemetry round-trip are kept for the
 // self-consistency test.
 #include "paged.hpp"
+#include "init.hpp"
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -1031,6 +1032,141 @@ std::string PagedPool::expert_file_path(int uid) const {
         return (fs::path(experts_dir_) / expert_file_name(uid)).string();
     }
     return expert_file_name(uid);
+}
+
+// --- Growth/prune lifecycle (section 5) ---
+
+int PagedPool::grow(int k, int step, double birth_gate,
+                    float weight_std, minagi::PcgRng& rng,
+                    const std::string& experts_dir) {
+    if (read_only_ || k <= 0) return n_experts_;
+
+    // For each new expert: allocate uid, init gate=birth_gate, write weights to disk
+    for (int i = 0; i < k; ++i) {
+        int uid = static_cast<int>(next_uid_++);
+        // Grow all lifecycle vectors
+        ever_.push_back(0);
+        uid_.push_back(static_cast<long long>(uid));
+        // Grow gate tensor
+        mt::Tensor new_gate;
+        mt::Shape gs; gs.rank = 1; gs.d[0] = n_experts_ + 1;
+        new_gate = mt::make(gs, mt::DType::FP32, 1.0f);
+        float* gp = new_gate.ptr<float>();
+        std::memcpy(gp, gate_.ptr<float>(), n_experts_ * sizeof(float));
+        gp[n_experts_] = static_cast<float>(birth_gate);
+        gate_ = new_gate;
+        // Grow gate_seen, born, age, etc.
+        auto grow_vec = [n = n_experts_](mt::Tensor& v, float new_val) {
+            mt::Shape s; s.rank = 1; s.d[0] = n + 1;
+            mt::Tensor out = mt::make(s, mt::DType::FP32, 0.0f);
+            float* p = out.ptr<float>();
+            std::memcpy(p, v.ptr<float>(), n * sizeof(float));
+            p[n] = new_val;
+            v = out;
+        };
+        grow_vec(gate_seen_, 0.0f);
+        grow_vec(born_, static_cast<float>(step));
+        grow_vec(age_, 0.0f);
+        grow_vec(since_, static_cast<float>(step));
+        grow_vec(last_seen_, static_cast<float>(step));
+        grow_vec(admits_, 0.0f);
+        grow_vec(use_, 0.0f);
+        // Grow uid tensor (if present)
+        if (!uid_.empty() && uid_[n_experts_] != uid) {
+            // uid already extended above
+        }
+
+        // Write new expert weights to disk (matches model.py Expert)
+        // w1 [d_ff, d_model], w3 [d_ff, d_model], w2 [d_model, d_ff]
+        minagi::PcgRng local_rng(static_cast<uint64_t>(uid * 2654435761ULL));
+        mt::Shape w1s; w1s.rank = 2; w1s.d[0] = d_ff_; w1s.d[1] = d_model_;
+        mt::Shape w2s; w2s.rank = 2; w2s.d[0] = d_model_; w2s.d[1] = d_ff_;
+        mt::Tensor w1 = minagi::init_normal(w1s, local_rng, 0.0f, weight_std);
+        mt::Tensor w3 = minagi::init_normal(w1s, local_rng, 0.0f, weight_std);
+        mt::Tensor w2 = minagi::init_normal(w2s, local_rng, 0.0f, weight_std);
+
+        // Write as e%05d.npz
+        std::string path = experts_dir + "/" + expert_file_name(uid);
+        std::vector<mininpz::NpzEntry> entries;
+        entries.push_back({"w1.npy", tensor_to_array(w1)});
+        entries.push_back({"w3.npy", tensor_to_array(w3)});
+        entries.push_back({"w2.npy", tensor_to_array(w2)});
+        mininpz::write_npz(path, entries);
+
+        ++n_experts_;
+    }
+    return n_experts_;
+}
+
+int PagedPool::prune(int step, int survival_steps, int protect) {
+    if (read_only_) return 0;
+
+    // Per Python: window is calibrated from segments
+    int seg = segments_;
+    double per_step = seg / static_cast<double>(std::max(step, 1));
+    double window = (per_step > 0) ? survival_steps * per_step : 1e300;
+
+    std::vector<int> keep;
+    for (int i = 0; i < n_experts_; ++i) {
+        if (i < protect) { keep.push_back(i); continue; }
+        // Check if resident
+        bool is_resident = false;
+        for (int s : slots_) if (s == i) { is_resident = true; break; }
+        if (is_resident) { keep.push_back(i); continue; }
+        // Check age: born less than survival_steps ago = young, keep
+        float born_step = born_.ptr<float>()[i];
+        if ((step - static_cast<int>(born_step)) < survival_steps) { keep.push_back(i); continue; }
+        // Check last_seen: seen within window = keep
+        float last_seen_step = last_seen_.ptr<float>()[i];
+        if ((seg - static_cast<int>(last_seen_step)) <= window) { keep.push_back(i); continue; }
+        // Otherwise: prune it
+    }
+
+    int gone = n_experts_ - static_cast<int>(keep.size());
+    if (gone <= 0) return 0;
+
+    // Remove pruned expert files from disk
+    if (experts_dir_set_ && tiers_) {
+        for (int i = 0; i < n_experts_; ++i) {
+            if (std::find(keep.begin(), keep.end(), i) == keep.end()) {
+                // Find the uid for this expert
+                long long uid = uid_[static_cast<size_t>(i)];
+                std::string path = experts_dir_ + "/" + expert_file_name(static_cast<int>(uid));
+                if (std::filesystem::exists(path)) {
+                    std::filesystem::remove(path);
+                }
+            }
+        }
+    }
+
+    // Compact arrays to keep[] indices
+    mt::Shape gs; gs.rank = 1; gs.d[0] = static_cast<int>(keep.size());
+    auto compact_tensor = [&gs](const mt::Tensor& src, const std::vector<int>& keep) -> mt::Tensor {
+        mt::Tensor out = mt::make(gs, mt::DType::FP32, 0.0f);
+        float* p = out.ptr<float>();
+        const float* s = src.ptr<float>();
+        for (size_t j = 0; j < keep.size(); ++j) p[j] = s[keep[j]];
+        return out;
+    };
+
+    gate_ = compact_tensor(gate_, keep);
+    gate_seen_ = compact_tensor(gate_seen_, keep);
+    born_ = compact_tensor(born_, keep);
+    age_ = compact_tensor(age_, keep);
+    since_ = compact_tensor(since_, keep);
+    last_seen_ = compact_tensor(last_seen_, keep);
+    admits_ = compact_tensor(admits_, keep);
+    use_ = compact_tensor(use_, keep);
+
+    // Compact uid vector
+    std::vector<long long> new_uid;
+    for (int k : keep) new_uid.push_back(uid_[static_cast<size_t>(k)]);
+    uid_ = new_uid;
+
+    ever_.resize(keep.size());
+    n_experts_ = static_cast<int>(keep.size());
+
+    return gone;
 }
 
 }  // namespace minagi::paged

@@ -83,6 +83,10 @@ if(ENABLE_DX12)
     target_compile_definitions(minagi_create PRIVATE NOMINMAX)
 endif()
 
+# ---- Training tool ----
+add_executable(minagi_train tools/train.cpp)
+target_link_libraries(minagi_train PRIVATE minimagi)
+
 # ---- Decode (inference) tool ----
 add_executable(minagi_decode tools/decode.cpp)
 target_link_libraries(minagi_decode PRIVATE minimagi)

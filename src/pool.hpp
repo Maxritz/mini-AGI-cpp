@@ -27,13 +27,49 @@ struct RouteStats {
   long long dropped = 0;  // assignments dropped by the capacity bound
 };
 
+// Saved routing info for backward pass through pool_mlp_forward.
+// Each entry: (token_row, slot_index, weight, kept)
+struct PoolDispatchInfo {
+  int64_t token;     // token row index
+  int slot;           // resident slot index chosen by routing
+  float weight;       // routed weight (after gate)
+  bool kept;          // survived capacity drop
+};
+
+struct PoolBackwardCache {
+  // All assignments (kept only) for reconstructing the scatter/scatter-grad
+  std::vector<PoolDispatchInfo> kept;
+  // logits [N, n_routable] for softmax backward
+  std::vector<float> logits;
+  int64_t N = 0;
+  int n_routable = 0;
+  int top_k = 0;
+  // x + (x + depth_emb) for router grad
+  std::vector<float> x_shifted;
+};
+
 // The mojito dispatch of section 4, exactly. x [T,d] FP32; router_w
 // [n_experts,d]; depth_emb [d]; returns [T,d]. top_k and capacity_factor as
 // passed. stats is optional (accumulates routed/dropped). Calls pool.note_use.
+// If cache != nullptr, saves routing info for pool_mlp_backward.
 // Returns a rank-0 tensor on bad input (non-FP32 / non-2D x, or a router_w /
 // depth_emb shape mismatch).
 mt::Tensor pool_mlp_forward(const Pool& pool, const mt::Tensor& x,
                             const mt::Tensor& router_w, const mt::Tensor& depth_emb,
-                            int top_k, double capacity_factor, RouteStats* stats);
+                            int top_k, double capacity_factor, RouteStats* stats,
+                            PoolBackwardCache* cache = nullptr);
+
+// Backward pass for pool_mlp_forward. Given the cache from forward and d_output
+// [N, D] (gradient w.r.t. the output), returns d_x [N, D] and fills:
+//   - d_router_w [n_experts, D] (gradient w.r.t. router weight)
+//   - d_depth_emb [D] (gradient w.r.t. depth embedding)
+mt::Tensor pool_mlp_backward(const Pool& pool,
+                             const PoolBackwardCache& cache,
+                             const mt::Tensor& d_output,
+                             const mt::Tensor& router_w,
+                             const mt::Tensor& depth_emb,
+                             int top_k, double capacity_factor,
+                             mt::Tensor* d_router_w,
+                             mt::Tensor* d_depth_emb);
 
 }  // namespace minagi
