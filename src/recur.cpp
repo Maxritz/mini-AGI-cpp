@@ -372,7 +372,8 @@ bool Coder::load_weights(std::vector<std::pair<std::string, mt::Tensor>>& sd,
         pre.w2.shape.rank == 0)
         return false;
 
-    // recurrent site blocks (pooled mlp -- weight = router/depth_emb, no dense w1/w3/w2)
+    // recurrent site blocks -- pooled mlp (router/depth_emb) when use_pool is
+    // set, otherwise a dense SwiGLU (w1/w3/w2) mirroring the prelude block.
     for (int i = 0; i < cfg_.n_recur; ++i) {
         std::string b = "recur." + std::to_string(i) + ".";
         auto& rb = blocks_[cfg_.n_prelude + i];
@@ -380,11 +381,22 @@ bool Coder::load_weights(std::vector<std::pair<std::string, mt::Tensor>>& sd,
         rb.qkv = get2(b + "attn.qkv.weight", 3 * d, d);
         rb.proj = get2(b + "attn.proj.weight", d, d);
         rb.ln2 = get1(b + "ln2.weight", d);
-        rb.router = get2(b + "mlp.router.weight", cfg_.pool_experts, d);
-        rb.depth_emb = get1(b + "mlp.depth_emb", d);
+        if (cfg_.use_pool) {
+            rb.router = get2(b + "mlp.router.weight", cfg_.pool_experts, d);
+            rb.depth_emb = get1(b + "mlp.depth_emb", d);
+        } else {
+            rb.w1 = get2(b + "mlp.w1.weight", dff, d);
+            rb.w3 = get2(b + "mlp.w3.weight", dff, d);
+            rb.w2 = get2(b + "mlp.w2.weight", d, dff);
+        }
         if (rb.ln1.shape.rank == 0 || rb.qkv.shape.rank == 0 || rb.proj.shape.rank == 0 ||
-            rb.ln2.shape.rank == 0 || rb.router.shape.rank == 0 ||
-            rb.depth_emb.shape.rank == 0)
+            rb.ln2.shape.rank == 0)
+            return false;
+        if (cfg_.use_pool &&
+            (rb.router.shape.rank == 0 || rb.depth_emb.shape.rank == 0))
+            return false;
+        if (!cfg_.use_pool &&
+            (rb.w1.shape.rank == 0 || rb.w3.shape.rank == 0 || rb.w2.shape.rank == 0))
             return false;
     }
 
@@ -561,11 +573,23 @@ StepOut Coder::forward(const mt::Tensor& idx,
             attn_residual(h, b.ln1, b.qkv, b.proj, caches, ci, T, H, hd, d,
                           pos_offset, cos, sin);
              ++ci;
-            // pooled mlp: pool_mlp_forward(pool, rms_norm(h, ln2), site router, depth_emb, top_k, cap)
             mt::Tensor hn2 = mt::rms_norm(h, b.ln2, 1e-6f);
-            mt::Tensor mlp_out = pool_mlp_forward(*pool_, hn2, b.router, b.depth_emb,
-                                                  cfg_.pool_top_k,
-                                                  cfg_.pool_capacity_factor, nullptr);
+            mt::Tensor mlp_out;
+            if (cfg_.use_pool) {
+                mlp_out = pool_mlp_forward(*pool_, hn2, b.router, b.depth_emb,
+                                           cfg_.pool_top_k,
+                                           cfg_.pool_capacity_factor, nullptr);
+            } else {
+                // dense SwiGLU at the recur site (no pool; mirrors the prelude)
+                mt::Tensor h1 = mt::matmul(hn2, transpose_2d(b.w1));
+                mt::Tensor h3 = mt::matmul(hn2, transpose_2d(b.w3));
+                mt::Tensor g = zeros2d(M, cfg_.d_ff);
+                float* gp = g.ptr<float>();
+                for (int64_t i = 0; i < M * cfg_.d_ff; ++i) {
+                    gp[i] = silu1(h1.atf(i)) * h3.atf(i);
+                }
+                mlp_out = mt::matmul(g, transpose_2d(b.w2));
+            }
             const float* mp = mlp_out.ptr<float>();
             float* hp = h.ptr<float>();
             for (int64_t i = 0; i < M * d; ++i) {

@@ -80,11 +80,14 @@ bool load(const std::string& dir,
 // router bundles, manifest with pool_resident and pool_max=max(pool_max,entries)
 // and cfg merged with pool_ever/pool_since; per-expert entries mirror the
 // manifest's expert list (moments==true). Atomic writes. Returns false on error.
+// router_sd holds extra router-bundle entries the caller wants in routers.npz
+// under their exact keys (kept out of core.npz).
 bool save_paged(const std::vector<std::pair<std::string, mt::Tensor>>& sd,
                 const minagi::paged::PagedPool& pool,
                 const mini::JsonValue& cfg_obj,
                 const std::string& dir, int step, double val,
-                SaveResult* out);
+                SaveResult* out,
+                const std::vector<std::pair<std::string, mt::Tensor>>* router_sd = nullptr);
 
 double best_val(const std::string& dir);
 std::string summarise(const std::string& dir);

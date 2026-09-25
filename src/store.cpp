@@ -390,7 +390,8 @@ bool save_paged(const std::vector<std::pair<std::string, mt::Tensor>>& sd,
                 const minagi::paged::PagedPool& pool,
                 const mini::JsonValue& cfg_obj_arg,
                 const std::string& dir, int step, double val,
-                SaveResult* out) {
+                SaveResult* out,
+                const std::vector<std::pair<std::string, mt::Tensor>>* router_sd) {
     SaveResult local;
     if (!out) out = &local;
     out->n_experts = 0;
@@ -403,11 +404,10 @@ bool save_paged(const std::vector<std::pair<std::string, mt::Tensor>>& sd,
         std::vector<std::string> core_keys, router_keys;
         std::vector<mininpz::NpzEntry> core_entries, router_entries;
         long long total = 0;
-        for (const auto& kv : sd) {
-            const std::string& key = kv.first;
-            if (minagi::paged::PagedPool::is_moment_key(key)) continue;  // skip optim state
-            mininpz::Array arr = minagi::paged::tensor_to_array(kv.second);
-            if (minagi::paged::PagedPool::is_router_key(key)) {
+        auto emit = [&](const std::string& key, const mt::Tensor& t, bool force_router) {
+            if (minagi::paged::PagedPool::is_moment_key(key)) return;  // skip optim state
+            mininpz::Array arr = minagi::paged::tensor_to_array(t);
+            if (force_router || minagi::paged::PagedPool::is_router_key(key)) {
                 router_keys.push_back(key);
                 router_entries.push_back({key + ".npy", arr});
                 total += static_cast<long long>(array_nbytes(arr));
@@ -416,6 +416,10 @@ bool save_paged(const std::vector<std::pair<std::string, mt::Tensor>>& sd,
                 core_entries.push_back({key + ".npy", arr});
                 total += static_cast<long long>(array_nbytes(arr));
             }
+        };
+        for (const auto& kv : sd) emit(kv.first, kv.second, false);
+        if (router_sd) {
+            for (const auto& kv : *router_sd) emit(kv.first, kv.second, true);
         }
         std::sort(core_keys.begin(), core_keys.end());
         std::sort(router_keys.begin(), router_keys.end());

@@ -87,6 +87,10 @@ endif()
 add_executable(minagi_decode tools/decode.cpp)
 target_link_libraries(minagi_decode PRIVATE minimagi)
 
+# ---- GGUF converter tool ----
+add_executable(minagi_gguf_convert tools/gguf_convert.cpp)
+target_link_libraries(minagi_gguf_convert PRIVATE minimagi)
+
 if(ENABLE_DX12)
     target_sources(minagi_decode PRIVATE src/dx12_context.cpp src/dx12_engine.cpp)
     target_link_libraries(minagi_decode PRIVATE d3d12 dxgi d3dcompiler)

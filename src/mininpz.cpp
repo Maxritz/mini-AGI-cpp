@@ -230,12 +230,11 @@ static void init_crc32() {
     crc32_init = true;
 }
 
-static uint32_t crc32(const uint8_t* data, size_t len) {
+static uint32_t crc32_update(uint32_t c, const uint8_t* data, size_t len) {
     init_crc32();
-    uint32_t c = 0xFFFFFFFFu;
     for (size_t i = 0; i < len; ++i)
         c = crc32_table[(c ^ data[i]) & 0xFF] ^ (c >> 8);
-    return c ^ 0xFFFFFFFFu;
+    return c;
 }
 
 static void write_u16(std::ostream& os, uint16_t v) {
@@ -251,6 +250,11 @@ static void write_u32(std::ostream& os, uint32_t v) {
         static_cast<uint8_t>((v >> 24) & 0xFF)
     };
     os.write(reinterpret_cast<const char*>(b), 4);
+}
+
+static void write_u64(std::ostream& os, uint64_t v) {
+    write_u32(os, static_cast<uint32_t>(v & 0xFFFFFFFFu));
+    write_u32(os, static_cast<uint32_t>(v >> 32));
 }
 
 static uint32_t read_u32(const uint8_t* p) {
@@ -298,90 +302,137 @@ static int parse_zip64_extra(const uint8_t* extra, size_t elen,
 }
 
 // ---- NPZ write ----
+// Always emitted in ZIP64 form (unconditional): 0xFFFFFFFF sentinels plus a
+// 0x0001 extra field holding the 8-byte values. Python/numpy read this fine,
+// and it keeps the writer independent of whether cumulative offsets cross the
+// 4 GiB boundary (which the >4 GiB model stores do).
 bool write_npz(const std::string& path, const std::vector<NpzEntry>& entries) {
     std::string tmp = path + ".tmp.npz";
-    std::ofstream f(tmp, std::ios::binary);
-    if (!f) return false;
+    {
+        std::ofstream f(tmp, std::ios::binary);
+        if (!f) return false;
 
-    struct EntryInfo {
-        std::string name;
-        uint32_t local_off;
-        uint32_t comp_size;
-        uint32_t uncomp_size;
-        uint32_t crc;
-    };
-    std::vector<EntryInfo> infos;
+        struct EntryInfo {
+            std::string name;
+            uint64_t local_off;
+            uint64_t comp_size;
+            uint64_t uncomp_size;
+            uint32_t crc;
+        };
+        std::vector<EntryInfo> infos;
 
-    for (const auto& e : entries) {
-        // serialize array to npy bytes
-        std::ostringstream npy_os;
-        npy_os.write("\x93NUMPY", 6);
-        uint8_t ver[2] = {1, 0};
-        npy_os.write(reinterpret_cast<const char*>(ver), 2);
-        std::string header = build_header(e.arr.dtype, e.arr.shape);
-        uint16_t hlen = static_cast<uint16_t>(header.size());
-        npy_os.write(reinterpret_cast<const char*>(&hlen), 2);
-        npy_os.write(header.data(), header.size());
-        size_t sz = e.arr.shape.numel() * dtype_size(e.arr.dtype);
-        if (sz > 0) npy_os.write(reinterpret_cast<const char*>(e.arr.bytes.data()), sz);
-        std::string npy_data = npy_os.str();
+        for (const auto& e : entries) {
+            // prefix: magic(6) + ver(2) + hlen(2) + header
+            std::string prefix;
+            prefix.reserve(10 + 128);
+            prefix.append("\x93NUMPY", 6);
+            prefix.push_back(1);  // major
+            prefix.push_back(0);  // minor
+            std::string header = build_header(e.arr.dtype, e.arr.shape);
+            uint16_t hlen = static_cast<uint16_t>(header.size());
+            prefix.push_back(static_cast<char>(hlen & 0xFF));
+            prefix.push_back(static_cast<char>(hlen >> 8));
+            prefix += header;
+            const size_t data_len = e.arr.shape.numel() * dtype_size(e.arr.dtype);
+            const uint64_t zsize = static_cast<uint64_t>(prefix.size()) + data_len;
+            uint32_t crc = crc32_update(0xFFFFFFFFu,
+                                        reinterpret_cast<const uint8_t*>(prefix.data()),
+                                        prefix.size());
+            if (data_len > 0)
+                crc = crc32_update(crc, e.arr.bytes.data(), data_len);
+            crc ^= 0xFFFFFFFFu;
+            const uint64_t local_off = static_cast<uint64_t>(f.tellp());
 
-        uint32_t crc = crc32(reinterpret_cast<const uint8_t*>(npy_data.data()), npy_data.size());
-        uint32_t local_off = static_cast<uint32_t>(f.tellp());
+            // local file header (zip64)
+            write_u32(f, 0x04034b50);
+            write_u16(f, 45);  // version needed
+            write_u16(f, 0);   // flags
+            write_u16(f, 0);   // method (stored)
+            write_u16(f, 0);   // mod time
+            write_u16(f, 0);   // mod date
+            write_u32(f, crc);
+            write_u32(f, 0xFFFFFFFFu); // comp size (zip64)
+            write_u32(f, 0xFFFFFFFFu); // uncomp size (zip64)
+            write_u16(f, static_cast<uint16_t>(e.name.size()));
+            write_u16(f, 20);  // extra len (0x0001, 16 bytes payload)
+            f.write(e.name.data(), e.name.size());
+            uint8_t extra[20];
+            extra[0] = 0x01; extra[1] = 0x00;  // tag 0x0001
+            extra[2] = 0x10; extra[3] = 0x00;  // size 16
+            uint8_t* p = extra + 4;
+            for (int k = 0; k < 8; ++k) *p++ = static_cast<uint8_t>((zsize >> (8 * k)) & 0xFF);
+            for (int k = 0; k < 8; ++k) *p++ = static_cast<uint8_t>((zsize >> (8 * k)) & 0xFF);
+            f.write(reinterpret_cast<const char*>(extra), 20);
+            f.write(prefix.data(), prefix.size());
+            if (data_len > 0)
+                f.write(reinterpret_cast<const char*>(e.arr.bytes.data()), data_len);
 
-        // local file header
-        write_u32(f, 0x04034b50);
-        write_u16(f, 20); // version
-        write_u16(f, 0);  // flags
-        write_u16(f, 0);  // method (stored)
-        write_u16(f, 0);  // mod time
-        write_u16(f, 0);  // mod date
-        write_u32(f, crc);
-        write_u32(f, static_cast<uint32_t>(npy_data.size())); // comp size
-        write_u32(f, static_cast<uint32_t>(npy_data.size())); // uncomp size
-        write_u16(f, static_cast<uint16_t>(e.name.size()));
-        write_u16(f, 0); // extra
-        f.write(e.name.data(), e.name.size());
-        f.write(npy_data.data(), npy_data.size());
+            infos.push_back({e.name, local_off, zsize, zsize, crc});
+        }
 
-        infos.push_back({e.name, local_off, static_cast<uint32_t>(npy_data.size()),
-                         static_cast<uint32_t>(npy_data.size()), crc});
+        const uint64_t cd_off = static_cast<uint64_t>(f.tellp());
+        for (const auto& info : infos) {
+            write_u32(f, 0x02014b50);
+            write_u16(f, 45);  // version made by
+            write_u16(f, 45);  // version needed
+            write_u16(f, 0);   // flags
+            write_u16(f, 0);   // method
+            write_u16(f, 0);   // mod time
+            write_u16(f, 0);   // mod date
+            write_u32(f, info.crc);
+            write_u32(f, 0xFFFFFFFFu); // comp size (zip64)
+            write_u32(f, 0xFFFFFFFFu); // uncomp size (zip64)
+            write_u16(f, static_cast<uint16_t>(info.name.size()));
+            write_u16(f, 28);  // extra len (0x0001, 24 bytes payload)
+            write_u16(f, 0);   // comment
+            write_u16(f, 0);   // disk number start
+            write_u16(f, 0);   // internal attrs
+            write_u32(f, 0);   // external attrs
+            write_u32(f, 0xFFFFFFFFu); // local header offset (zip64)
+            f.write(info.name.data(), info.name.size());
+            uint8_t extra[28];
+            extra[0] = 0x01; extra[1] = 0x00;  // tag 0x0001
+            extra[2] = 0x18; extra[3] = 0x00;  // size 24
+            uint8_t* p = extra + 4;
+            auto put64 = [&](uint64_t v) {
+                for (int k = 0; k < 8; ++k) *p++ = static_cast<uint8_t>((v >> (8 * k)) & 0xFF);
+            };
+            put64(info.uncomp_size);
+            put64(info.comp_size);
+            put64(info.local_off);
+            f.write(reinterpret_cast<const char*>(extra), 28);
+        }
+        const uint64_t cd_size = static_cast<uint64_t>(f.tellp()) - cd_off;
+
+        // ZIP64 end of central directory record
+        const uint64_t z64_off = cd_off + cd_size;
+        write_u32(f, 0x06064b50);
+        write_u64(f, 44);  // size of remaining record (44 bytes)
+        write_u16(f, 45);  // version made by
+        write_u16(f, 45);  // version needed
+        write_u32(f, 0);   // this disk
+        write_u32(f, 0);   // cd start disk
+        write_u64(f, static_cast<uint64_t>(infos.size())); // entries this disk
+        write_u64(f, static_cast<uint64_t>(infos.size())); // entries total
+        write_u64(f, cd_size);
+        write_u64(f, cd_off);
+
+        // ZIP64 locator
+        write_u32(f, 0x07064b50);
+        write_u32(f, 0);       // disk with zip64 eocd
+        write_u64(f, z64_off); // offset of zip64 eocd
+        write_u32(f, 1);       // total disks
+
+        // standard EOCD (closing sentinels; used only as the search anchor)
+        write_u32(f, 0x06054b50);
+        write_u16(f, 0);
+        write_u16(f, 0);
+        write_u16(f, 0xFFFF);
+        write_u16(f, 0xFFFF);
+        write_u32(f, 0xFFFFFFFFu);
+        write_u32(f, 0xFFFFFFFFu);
+        write_u16(f, 0);
     }
-
-    uint32_t cd_off = static_cast<uint32_t>(f.tellp());
-    for (const auto& info : infos) {
-        write_u32(f, 0x02014b50);
-        write_u16(f, 20); // version made by
-        write_u16(f, 20); // version needed
-        write_u16(f, 0);  // flags
-        write_u16(f, 0);  // method
-        write_u16(f, 0);  // mod time
-        write_u16(f, 0);  // mod date
-        write_u32(f, info.crc);
-        write_u32(f, info.comp_size);
-        write_u32(f, info.uncomp_size);
-        write_u16(f, static_cast<uint16_t>(info.name.size()));
-        write_u16(f, 0); // extra
-        write_u16(f, 0); // comment
-        write_u16(f, 0); // disk number start
-        write_u16(f, 0); // internal attrs
-        write_u32(f, 0); // external attrs
-        write_u32(f, info.local_off);
-        f.write(info.name.data(), info.name.size());
-    }
-    uint32_t cd_size = static_cast<uint32_t>(f.tellp()) - cd_off;
-
-    // end of central directory
-    write_u32(f, 0x06054b50);
-    write_u16(f, 0); // disk number
-    write_u16(f, 0); // disk with cd
-    write_u16(f, static_cast<uint16_t>(infos.size()));
-    write_u16(f, static_cast<uint16_t>(infos.size()));
-    write_u32(f, cd_size);
-    write_u32(f, cd_off);
-    write_u16(f, 0); // comment length
-
-    f.close();
 
     std::error_code ec;
     if (std::filesystem::is_directory(path, ec)) return false;
@@ -390,128 +441,145 @@ bool write_npz(const std::string& path, const std::vector<NpzEntry>& entries) {
 }
 
 // ---- NPZ read ----
+// Streaming, seek-based reader. Handles both the legacy 32-bit layout (old
+// writer / small archives) and ZIP64 (offsets and sizes > 4 GiB). Only stored
+// (uncompressed) entries are supported, which is what every writer emits.
 bool read_npz(const std::string& path, std::vector<NpzEntry>& out) {
+    out.clear();
     std::ifstream f(path, std::ios::binary);
     if (!f) return false;
-    std::vector<uint8_t> buf(std::istreambuf_iterator<char>(f), {});
-    if (buf.size() < 22) return false;
+    f.seekg(0, std::ios::end);
+    const int64_t file_size = f.tellg();
+    if (file_size < 22) return false;
 
-    // find end of central directory
-    size_t eocd = 0;
-    if (buf.size() >= 22) {
-        for (size_t i = buf.size() - 21U; i-- > 0;) {
-            if (buf[i] == 0x50 && buf[i + 1] == 0x4b && buf[i + 2] == 0x05 && buf[i + 3] == 0x06) {
-                eocd = i;
-                break;
-            }
+    // locate the standard EOCD by scanning its 4-byte signature at the end
+    const int64_t max_scan = std::min<int64_t>(file_size, 65557 + 22);
+    const int64_t rd_start = file_size - max_scan;
+    f.seekg(static_cast<std::streamoff>(rd_start));
+    std::vector<uint8_t> tail(static_cast<size_t>(max_scan));
+    if (!f.read(reinterpret_cast<char*>(tail.data()), static_cast<std::streamsize>(max_scan)))
+        return false;
+    int64_t eocd = -1;
+    for (int64_t i = max_scan - 22; i >= 0; --i) {
+        if (tail[static_cast<size_t>(i)] == 0x50 &&
+            tail[static_cast<size_t>(i + 1)] == 0x4b &&
+            tail[static_cast<size_t>(i + 2)] == 0x05 &&
+            tail[static_cast<size_t>(i + 3)] == 0x06) {
+            eocd = rd_start + i;
+            break;
         }
     }
-    if (eocd == 0 && !(buf[0] == 0x50 && buf[1] == 0x4b && buf[2] == 0x05 && buf[3] == 0x06)) return false;
+    if (eocd < 0) return false;
+    const size_t eoff = static_cast<size_t>(eocd - rd_start);
 
-    uint16_t num_entries = read_u16(&buf[eocd + 10]);
-    uint32_t cd_size = read_u32(&buf[eocd + 12]);
-    uint32_t cd_off = read_u32(&buf[eocd + 16]);
+    uint64_t num_entries = read_u16(&tail[eoff + 10]);
+    const uint32_t cd_size32 = read_u32(&tail[eoff + 12]);
+    const uint32_t cd_off32 = read_u32(&tail[eoff + 16]);
+    uint64_t cd_off = cd_off32;
 
-    // ZIP64 end of central directory fallback
-    if (num_entries == 0xFFFF || cd_size == 0xFFFFFFFFu || cd_off == 0xFFFFFFFFu) {
-        if (eocd < 20) return false;
-        size_t zloc = eocd - 20;
-        if (buf[zloc] == 0x50 && buf[zloc + 1] == 0x4b && buf[zloc + 2] == 0x06 && buf[zloc + 3] == 0x07) {
-            uint64_t z64_off = read_u64(&buf[zloc + 8]);
-            if (z64_off + 56 > buf.size()) return false;
-            const uint8_t* z = &buf[static_cast<size_t>(z64_off)];
-            if (!(z[0] == 0x50 && z[1] == 0x4b && z[2] == 0x06 && z[3] == 0x06)) return false;
-            uint64_t ents = read_u64(z + 32);
-            uint64_t cdsz = read_u64(z + 40);
-            uint64_t cdo = read_u64(z + 48);
-            if (ents > 0xFFFF) return false;
-            num_entries = static_cast<uint16_t>(ents);
-            cd_size = static_cast<uint32_t>(cdsz);
-            cd_off = static_cast<uint32_t>(cdo);
-        } else {
-            return false;
-        }
+    if (num_entries == 0xFFFF || cd_size32 == 0xFFFFFFFFu || cd_off32 == 0xFFFFFFFFu) {
+        // ZIP64: locator sits 20 bytes before the standard EOCD.
+        const int64_t zloc = eocd - 20;
+        if (zloc < 0) return false;
+        f.seekg(static_cast<std::streamoff>(zloc));
+        uint8_t lb[20];
+        if (!f.read(reinterpret_cast<char*>(lb), 20)) return false;
+        if (!(lb[0] == 0x50 && lb[1] == 0x4b && lb[2] == 0x06 && lb[3] == 0x07)) return false;
+        const uint64_t z64_off = read_u64(lb + 8);
+        if (z64_off + 56 > static_cast<uint64_t>(file_size)) return false;
+        f.seekg(static_cast<std::streamoff>(z64_off));
+        uint8_t z[56];
+        if (!f.read(reinterpret_cast<char*>(z), 56)) return false;
+        if (!(z[0] == 0x50 && z[1] == 0x4b && z[2] == 0x06 && z[3] == 0x06)) return false;
+        num_entries = read_u64(z + 32);
+        cd_off = read_u64(z + 48);
     }
 
-    size_t pos = cd_off;
-    for (uint16_t i = 0; i < num_entries; ++i) {
-        if (pos + 46 > buf.size()) return false;
-        if (buf[pos] != 0x50 || buf[pos + 1] != 0x4b || buf[pos + 2] != 0x01 || buf[pos + 3] != 0x02)
+    uint64_t cd_cursor = cd_off;
+    for (uint64_t i = 0; i < num_entries; ++i) {
+        f.seekg(static_cast<std::streamoff>(cd_cursor));
+        uint8_t c[46];
+        if (!f.read(reinterpret_cast<char*>(c), 46)) return false;
+        if (!(c[0] == 0x50 && c[1] == 0x4b && c[2] == 0x01 && c[3] == 0x02)) return false;
+        const uint16_t name_len = read_u16(c + 28);
+        const uint16_t extra_len = read_u16(c + 30);
+        const uint16_t comment_len = read_u16(c + 32);
+        cd_cursor += 46 + name_len + extra_len + comment_len;
+        const uint32_t c_comp = read_u32(c + 20);
+        const uint32_t c_uncomp = read_u32(c + 24);
+        const uint32_t lo32 = read_u32(c + 42);
+
+        std::string name(static_cast<size_t>(name_len), '\0');
+        if (name_len > 0 && !f.read(&name[0], name_len)) return false;
+        std::vector<uint8_t> extra(static_cast<size_t>(extra_len));
+        if (extra_len > 0 && !f.read(reinterpret_cast<char*>(extra.data()), extra_len))
             return false;
-        uint16_t name_len = read_u16(&buf[pos + 28]);
-        uint16_t extra_len = read_u16(&buf[pos + 30]);
-        uint16_t comment_len = read_u16(&buf[pos + 32]);
-        uint32_t c_comp_size = read_u32(&buf[pos + 20]);
-        uint32_t c_uncomp_size = read_u32(&buf[pos + 24]);
-        uint32_t local_off = read_u32(&buf[pos + 42]);
-        if (name_len + comment_len > 0 && pos + 46 + name_len + extra_len + comment_len > buf.size())
-            return false;
-        std::string name(reinterpret_cast<const char*>(&buf[pos + 46]), name_len);
-        if (c_comp_size == 0xFFFFFFFFu || c_uncomp_size == 0xFFFFFFFFu || local_off == 0xFFFFFFFFu) {
-            if (pos + 46 + name_len + extra_len > buf.size()) return false;
-            uint64_t z64[3];
-            parse_zip64_extra(&buf[pos + 46 + name_len], extra_len, z64);
-            uint32_t u = 0, c = 0, lo = 0;
-            // fields present in order: uncomp, comp, local offset
-            for (int idx = 0; idx < 3; ++idx) {
-                if (idx == 0) { if (c_uncomp_size == 0xFFFFFFFFu) u = static_cast<uint32_t>(z64[0]); }
-                if (idx == 1) { if (c_comp_size == 0xFFFFFFFFu) c = static_cast<uint32_t>(z64[1]); }
-                if (idx == 2) { if (local_off == 0xFFFFFFFFu) lo = static_cast<uint32_t>(z64[2]); }
+        if (comment_len > 0) f.seekg(static_cast<std::streamoff>(comment_len), std::ios::cur);
+
+        uint64_t local_off = lo32;
+        if (c_uncomp == 0xFFFFFFFFu || c_comp == 0xFFFFFFFFu || lo32 == 0xFFFFFFFFu) {
+            uint64_t z64[3] = {0, 0, 0};
+            parse_zip64_extra(extra.data(), extra.size(), z64);
+            int fld = 0;
+            if (c_uncomp == 0xFFFFFFFFu) ++fld;  // uncompressed size field
+            if (c_comp == 0xFFFFFFFFu) ++fld;    // compressed size field
+            if (lo32 == 0xFFFFFFFFu) local_off = z64[fld++];
+        }
+
+        f.seekg(static_cast<std::streamoff>(local_off));
+        uint8_t lh[30];
+        if (!f.read(reinterpret_cast<char*>(lh), 30)) return false;
+        if (!(lh[0] == 0x50 && lh[1] == 0x4b && lh[2] == 0x03 && lh[3] == 0x04)) return false;
+        const uint16_t l_method = read_u16(lh + 8);
+        const uint32_t l_comp = read_u32(lh + 18);
+        const uint32_t l_uncomp = read_u32(lh + 22);
+        const uint16_t l_name = read_u16(lh + 26);
+        const uint16_t l_extra = read_u16(lh + 28);
+        uint64_t lcomp = l_comp;
+        if (l_comp == 0xFFFFFFFFu || l_uncomp == 0xFFFFFFFFu) {
+            if (l_extra > 0) {
+                f.seekg(static_cast<std::streamoff>(l_name), std::ios::cur);
+                std::vector<uint8_t> lex(static_cast<size_t>(l_extra));
+                if (!f.read(reinterpret_cast<char*>(lex.data()), l_extra)) return false;
+                uint64_t z64[3] = {0, 0, 0};
+                parse_zip64_extra(lex.data(), lex.size(), z64);
+                int fld = 0;
+                if (l_uncomp == 0xFFFFFFFFu) ++fld;  // uncompressed size field
+                if (l_comp == 0xFFFFFFFFu) lcomp = z64[fld++];
             }
-            if (u != 0) c_uncomp_size = u;
-            if (c != 0) c_comp_size = c;
-            if (lo != 0) local_off = lo;
         }
-        pos += 46 + name_len + extra_len + comment_len;
+        const uint64_t data_off = local_off + 30 + l_name + l_extra;
+        if (l_method != 0) return false;  // only stored
+        if (data_off + lcomp > static_cast<uint64_t>(file_size)) return false;
 
-        if (local_off + 30 > buf.size()) return false;
-        if (buf[local_off] != 0x50 || buf[local_off + 1] != 0x4b || buf[local_off + 2] != 0x03 || buf[local_off + 3] != 0x04)
-            return false;
-        uint16_t l_method = read_u16(&buf[local_off + 8]);
-        uint32_t l_comp_size = read_u32(&buf[local_off + 18]);
-        uint32_t l_uncomp_size = read_u32(&buf[local_off + 22]);
-        uint16_t l_name_len = read_u16(&buf[local_off + 26]);
-        uint16_t l_extra_len = read_u16(&buf[local_off + 28]);
-        if (l_comp_size == 0xFFFFFFFFu || l_uncomp_size == 0xFFFFFFFFu) {
-            if (local_off + 30 + l_name_len + l_extra_len > buf.size()) return false;
-            uint64_t z64[3];
-            parse_zip64_extra(&buf[local_off + 30 + l_name_len], l_extra_len, z64);
-            if (l_uncomp_size == 0xFFFFFFFFu) l_uncomp_size = static_cast<uint32_t>(z64[0]);
-            if (l_comp_size == 0xFFFFFFFFu) l_comp_size = static_cast<uint32_t>(z64[1]);
-        }
-        size_t data_off = local_off + 30 + l_name_len + l_extra_len;
-
-        if (l_method != 0) return false; // only stored
-        if (data_off + l_comp_size > buf.size()) return false;
-
-        Array arr;
-        std::vector<uint8_t> npy_bytes(buf.begin() + data_off, buf.begin() + data_off + l_comp_size);
-        // parse npy from memory
-        if (npy_bytes.size() < 10) return false;
-        if (std::memcmp(npy_bytes.data(), "\x93NUMPY", 6) != 0) return false;
-        uint8_t major = npy_bytes[6];
+        f.seekg(static_cast<std::streamoff>(data_off));
+        uint8_t nm[10];
+        if (!f.read(reinterpret_cast<char*>(nm), 10)) return false;
+        if (std::memcmp(nm, "\x93NUMPY", 6) != 0) return false;
+        const uint8_t major = nm[6];
         if (major != 1 && major != 2) return false;
-        size_t hoff = 8;
         uint32_t hlen = 0;
         if (major == 1) {
-            hlen = read_u16(&npy_bytes[hoff]);
-            hoff += 2;
+            hlen = read_u16(nm + 8);
         } else {
-            hlen = read_u32(&npy_bytes[hoff]);
-            hoff += 4;
+            hlen = read_u32(nm + 6);
         }
-        if (hoff + hlen > npy_bytes.size()) return false;
-        std::string header(reinterpret_cast<const char*>(&npy_bytes[hoff]), hlen);
+        std::string header(hlen, '\0');
+        if (hlen > 0 && !f.read(&header[0], hlen)) return false;
         while (!header.empty() && (header.back() == ' ' || header.back() == '\n' || header.back() == '\r'))
             header.pop_back();
         DType dt;
         Shape sh;
         if (!parse_header_dict(header, dt, sh)) return false;
+        const size_t sz = sh.numel() * dtype_size(dt);
+
+        Array arr;
         arr.dtype = dt;
         arr.shape = sh;
-        size_t sz = sh.numel() * dtype_size(dt);
-        if (hoff + hlen + sz > npy_bytes.size()) return false;
-        arr.bytes.assign(npy_bytes.begin() + hoff + hlen, npy_bytes.begin() + hoff + hlen + sz);
+        arr.bytes.resize(sz);
+        if (sz > 0 &&
+            !f.read(reinterpret_cast<char*>(arr.bytes.data()), static_cast<std::streamsize>(sz)))
+            return false;
 
         out.push_back({name, arr});
     }
