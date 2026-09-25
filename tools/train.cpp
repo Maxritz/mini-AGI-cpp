@@ -116,7 +116,11 @@ int main(int argc, char** argv) {
             mt::Shape w2s; w2s.rank = 2; w2s.d[0] = cfg.d_model; w2s.d[1] = cfg.pool_d_ff;
             mt::Tensor w2 = minagi::init_normal(w2s, init_rng, 0.0f, 0.02f);
 
-            std::string path = experts_base + "/e" + std::to_string(eid) + ".npz";
+            // e%05d.npz: must match Tiers::file_path / PagedPool::expert_uid or
+            // reload can never find these experts (STATUS train gap #3).
+            char ename[32];
+            std::snprintf(ename, sizeof(ename), "e%05d.npz", eid);
+            std::string path = experts_base + "/" + ename;
             std::vector<mininpz::NpzEntry> entries;
             entries.push_back({"w1.npy", minagi::paged::tensor_to_array(w1)});
             entries.push_back({"w3.npy", minagi::paged::tensor_to_array(w3)});
@@ -124,6 +128,10 @@ int main(int argc, char** argv) {
             mininpz::write_npz(path, entries);
         }
         pool_ptr->set_experts_dir(experts_base);
+        // Initial swap: a fresh pool has slots=[-1]*resident and zero weights.
+        // Without this, all routing collapses to expert 0's zeros and no pool
+        // gradient ever flows. (No reselect protocol in this toy loop.)
+        coder.begin_segment();
     }
 
     std::vector<int32_t> tokens;
@@ -209,6 +217,44 @@ int main(int argc, char** argv) {
                 }
             }
             opt.step(paired);
+
+            // Expert + gate stepping (pool params live in the PagedPool, not
+            // the coder). Expert grads are keyed pool.experts.{uid}.w*.weight
+            // with per-uid AdamW moments (stable across swaps); the resident
+            // row is stepped via copy-out/update/copy-back and persisted by
+            // pool flush before checkpointing.
+            if (pool_ptr) {
+                const std::vector<int>& pslots = pool_ptr->slots();
+                auto step_expert_row = [&](const std::string& leaf,
+                                           mt::Tensor& resident, int64_t row_numel) {
+                    for (size_t s = 0; s < pslots.size(); ++s) {
+                        const int pos = pslots[s];
+                        if (pos < 0) continue;
+                        const int uid = pool_ptr->expert_uid(pos);
+                        if (uid < 0) continue;
+                        const std::string key = "pool.experts." +
+                                                std::to_string(uid) + "." + leaf;
+                        mt::Tensor* g = grads.get(key);
+                        if (!g) continue;
+                        mt::Tensor row;
+                        pool_ptr->row_of(resident, static_cast<int>(s), row_numel, row);
+                        opt.update_param(row, *g, key);
+                        minagi::paged::PagedPool::set_row(resident, static_cast<int>(s), row);
+                    }
+                };
+                const int64_t row12 =
+                    static_cast<int64_t>(cfg.pool_d_ff) * cfg.d_model;
+                step_expert_row("w1.weight", pool_ptr->mutable_w1(), row12);
+                step_expert_row("w3.weight", pool_ptr->mutable_w3(), row12);
+                step_expert_row("w2.weight", pool_ptr->mutable_w2(), row12);
+                // Gate: copy-step-restore (moments keyed "pool.gate").
+                mt::Tensor* gg = grads.get("pool.gate");
+                if (gg) {
+                    mt::Tensor gate = pool_ptr->gate();
+                    opt.update_param(gate, *gg, "pool.gate");
+                    pool_ptr->set_gate(gate);
+                }
+            }
         }
 
         if (step % 10 == 0 || step == args.steps - 1) {
@@ -280,6 +326,11 @@ int main(int argc, char** argv) {
             std::string save_dir = args.out_dir.empty()
                 ? ("ckpt_step" + std::to_string(step + 1))
                 : (args.out_dir + "/step" + std::to_string(step + 1));
+
+            // Flush stepped residents to experts_base FIRST so the checkpoint
+            // copies current (not initial) expert weights. Without this the
+            // experts train in RAM and the checkpoint silently keeps step-0.
+            if (pool_ptr) pool_ptr->flush();
 
             // Set pool's experts_dir to checkpoint dir and copy expert files there
             if (pool_ptr) {

@@ -61,8 +61,14 @@ mt::Tensor pool_mlp_forward(const Pool& pool, const mt::Tensor& x,
 
 // Backward pass for pool_mlp_forward. Given the cache from forward and d_output
 // [N, D] (gradient w.r.t. the output), returns d_x [N, D] and fills:
-//   - d_router_w [n_experts, D] (gradient w.r.t. router weight)
-//   - d_depth_emb [D] (gradient w.r.t. depth embedding)
+//   - d_router_w [n_experts, D] (full softmax-Jacobian path through the
+//     top-k normalization; hard selection indices carry no grad)
+//   - d_depth_emb [D] (via x_shifted = x + depth_emb)
+//   - d_w1/d_w3 [n, dff, D] slot-major expert SwiGLU grads (kept assignments)
+//   - d_w2 [n, D, dff] slot-major
+//   - d_gate [n_experts] (dL/dw * normalized weight per kept assignment)
+// Dropped assignments contribute only through the normalization sum S.
+// Any out-pointer may be null to skip that gradient.
 mt::Tensor pool_mlp_backward(const Pool& pool,
                              const PoolBackwardCache& cache,
                              const mt::Tensor& d_output,
@@ -70,6 +76,10 @@ mt::Tensor pool_mlp_backward(const Pool& pool,
                              const mt::Tensor& depth_emb,
                              int top_k, double capacity_factor,
                              mt::Tensor* d_router_w,
-                             mt::Tensor* d_depth_emb);
+                             mt::Tensor* d_depth_emb,
+                             mt::Tensor* d_w1,
+                             mt::Tensor* d_w3,
+                             mt::Tensor* d_w2,
+                             mt::Tensor* d_gate);
 
 }  // namespace minagi

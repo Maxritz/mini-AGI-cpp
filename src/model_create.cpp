@@ -136,7 +136,7 @@ std::map<std::string, mt::Tensor> build_model(const Config& cfg, PcgRng& rng) {
     adapter_shape.rank = 2;
     adapter_shape.d[0] = d;
     adapter_shape.d[1] = 2 * d;
-    out["adapter.weight"] = init_eye(d, 2 * d);
+    out["adapter.weight"] = init_adapter(d);
 
     // --- ln_f.weight = 1.0 ---
     mt::Shape lnf_shape;

@@ -117,6 +117,33 @@ public:
 
   std::vector<int> resident_rows() const;   // [max(s,0) for s in slots]
   mt::Tensor routable_gate() const;         // gate[resident_rows()]
+  // Stable file uid for the expert at position pos (slots() holds positions;
+  // uid_ maps position -> e%05d.npz identity, stable across prune). -1 if bad.
+  int expert_uid(int pos) const;
+  // Training write path: mutable resident tensors + row copy in/out so the
+  // optimizer can step per-uid expert rows (moments keyed by uid stay valid
+  // across swaps) and flush() persists them. Prefer row_of/set_row over
+  // hand-rolled pointer arithmetic to keep the [slot, ...] layout in one place.
+  //
+  // Precondition for every use of mutable_* below: slots_valid() must hold.
+  // The resident tensors are indexed [slot, ...] and a slot only identifies an
+  // expert once slots_ maps it to a uid, so writing them while slots_ is all -1
+  // (the post-construction state, before Coder::begin_segment()) produces a
+  // forward where every site routes to expert 0 and every other expert's
+  // gradient is identically zero - a silently degenerate result, not a crash.
+  // assert_slots_valid() enforces that at the boundary; slots_valid() is the
+  // query callers can branch on.
+  bool slots_valid() const {
+    for (int s : slots_) if (s < 0) return false;
+    return !slots_.empty();
+  }
+  void assert_slots_valid(const char* who) const;
+  mt::Tensor& mutable_w1() { assert_slots_valid("mutable_w1"); return w1_; }
+  mt::Tensor& mutable_w3() { assert_slots_valid("mutable_w3"); return w3_; }
+  mt::Tensor& mutable_w2() { assert_slots_valid("mutable_w2"); return w2_; }
+  void row_of(const mt::Tensor& t, int slot, int64_t row_numel,
+              mt::Tensor& out) const;       // copy [d_ff,d]/[d,d_ff]/[d] row
+  static void set_row(mt::Tensor& t, int slot, const mt::Tensor& row);
 
   // Segment lifecycle:
   std::vector<int> choose();                // section-3 choose()
@@ -161,9 +188,6 @@ private:
   void refresh_keys();                  // segments%8==0 (never fires in the golden)
   mt::Tensor key_of(const mt::Tensor& w1) const;  // dominant input direction
   double segment_score(int e) const;    // choose() logit for expert e
-  void row_of(const mt::Tensor& t, int slot, int64_t row_numel,
-              mt::Tensor& out) const;       // copy [d_ff,d]/[d,d_ff]/[d] row
-  void set_row(mt::Tensor& t, int slot, const mt::Tensor& row);
   std::string expert_file_path(int uid) const;  // experts/e%05d.npz in experts_dir_
 
   mutable int n_experts_;

@@ -73,6 +73,14 @@ add_executable(test_model tests/test_model.cpp)
 target_link_libraries(test_model PRIVATE minimagi)
 add_test(NAME test_model COMMAND test_model)
 
+add_executable(test_pool_backward tests/test_pool_backward.cpp)
+target_link_libraries(test_pool_backward PRIVATE minimagi)
+add_test(NAME test_pool_backward COMMAND test_pool_backward)
+
+add_executable(test_backward tests/test_backward.cpp)
+target_link_libraries(test_backward PRIVATE minimagi)
+add_test(NAME test_backward COMMAND test_backward)
+
 # ---- Model creation tool ----
 add_executable(minagi_create tools/create.cpp)
 target_link_libraries(minagi_create PRIVATE minimagi)

@@ -83,6 +83,20 @@ mt::Tensor init_eye(int rows, int cols) {
     return t;
 }
 
+mt::Tensor init_adapter(int d_model) {
+    mt::Shape s;
+    s.rank = 2;
+    s.d[0] = d_model;
+    s.d[1] = 2 * d_model;
+    mt::Tensor t = mt::make(s, mt::DType::FP32, 0.0f);
+    float* p = t.ptr<float>();
+    for (int i = 0; i < d_model; ++i) {
+        p[i * 2 * d_model + i] = 1.0f;              // h_prev path
+        p[i * 2 * d_model + d_model + i] = 1.0f;    // x path
+    }
+    return t;
+}
+
 mt::Tensor init_const(const mt::Shape& s, float val) {
     return mt::make(s, mt::DType::FP32, val);
 }

@@ -30,6 +30,21 @@ inline float silu1(float x) {
   return x * e / (1.0f + e);
 }
 
+inline float sigmoid1(float x) {
+  if (x >= 0.0f) {
+    return 1.0f / (1.0f + std::exp(-x));
+  }
+  const float e = std::exp(x);
+  return e / (1.0f + e);
+}
+
+// d/dx silu(x), x*sigmoid(x): s*(1 + x*(1-s)). Kept separate from silu1 so a
+// wrong-derivative regression (cf. STATUS gap #3) is caught by name in review.
+inline float silu_deriv1(float x) {
+  const float s = sigmoid1(x);
+  return s * (1.0f + x * (1.0f - s));
+}
+
 mt::Tensor zeros2d(int64_t r, int64_t c) {
   mt::Shape s;
   s.rank = 2;
@@ -365,11 +380,15 @@ mt::Tensor pool_mlp_forward(const Pool& pool, const mt::Tensor& x,
 }
 
 // ---- pool_mlp_backward ----
-// Reverse-mode autograd through pool_mlp_forward.
-// Forward was: output[t] += w * expert_fn(x[t])  where w = routable_gate * softmax_norm
-// So: d_x[t] = sum over kept assignments to t of w * d_expert_fn
-//     d_w = expert_fn(x[t]) * d_output[t]
-// Router grad: d_router_w = sum over assignments of (d_softmax * routable_gate + softmax * d_gate) * x_shifted
+// Reverse-mode autograd through pool_mlp_forward, matching the forward exactly:
+//   logits[r,c] = x_shifted[r] . router_w[rows[c]], x_shifted = x + depth_emb
+//   probs[r] = softmax(logits[r]); top-k select idx, p = selected probs
+//   nrm[i] = p[i]/S, S = sum p; w[i] = nrm[i] * gate[rows[idx[i]]]
+//   out[t] += w * expert_s(x[t]) over kept assignments (capacity drop constant)
+// Non-differentiable: top-k indices, capacity keep/drop mask.
+// dL/dw (kept) = dout.y; dropped ranks enter only through the S Jacobian.
+// Expert SwiGLU: y = W2.(silu(x.W1^T) * (x.W3^T)); dh is strictly per-item
+// (a per-slot dh would mix gradients across tokens sharing the slot).
 mt::Tensor pool_mlp_backward(const Pool& pool,
                              const PoolBackwardCache& cache,
                              const mt::Tensor& d_output,
@@ -377,17 +396,40 @@ mt::Tensor pool_mlp_backward(const Pool& pool,
                              const mt::Tensor& depth_emb,
                              int top_k, double capacity_factor,
                              mt::Tensor* d_router_w,
-                             mt::Tensor* d_depth_emb) {
+                             mt::Tensor* d_depth_emb,
+                             mt::Tensor* d_w1,
+                             mt::Tensor* d_w3,
+                             mt::Tensor* d_w2,
+                             mt::Tensor* d_gate) {
+    (void)top_k;
+    (void)capacity_factor;
     const int64_t N = cache.N;
     const int n = cache.n_routable;
     const int k = cache.top_k;
-    const int D = static_cast<int>(cache.x_shifted.size() / N);
+    const int D = (N > 0) ? static_cast<int>(cache.x_shifted.size() / N) : 0;
     const int dff = static_cast<int>(pool.w1().shape.d[1]);
     const int ne = static_cast<int>(router_w.shape.d[0]);
     const float* xp = cache.x_shifted.data();
     const float* gp = pool.gate().ptr<float>();
+    const float* dop = d_output.ptr<float>();
+    const float* rw = router_w.ptr<float>();
+    const float* dp0 = depth_emb.ptr<float>();
+    const float* w1p = pool.w1().ptr<float>();
+    const float* w3p = pool.w3().ptr<float>();
+    const float* w2p = pool.w2().ptr<float>();
 
-    // Re-derive rows[] and slots from pool
+    // Raw expert input: forward evaluates experts at x, while the router sees
+    // x_shifted = x + depth_emb. Recover x exactly (x_shifted and depth_emb
+    // are both cached/available).
+    std::vector<float> xraw(static_cast<size_t>(N) * D);
+    for (int64_t r = 0; r < N; ++r) {
+        for (int dd = 0; dd < D; ++dd) {
+            xraw[static_cast<size_t>(r) * D + dd] =
+                xp[static_cast<size_t>(r) * D + dd] - dp0[dd];
+        }
+    }
+
+    // rows[]: slot -> expert position (indexes router_w/gate, cf. forward).
     const std::vector<int>& slots = pool.slots();
     std::vector<int> rows(static_cast<size_t>(n), 0);
     for (int j = 0; j < n; ++j) {
@@ -395,7 +437,7 @@ mt::Tensor pool_mlp_backward(const Pool& pool,
         rows[j] = s > 0 ? s : 0;
     }
 
-    // Recompute softmax probs from cached logits
+    // Recompute softmax probs from cached logits (same arithmetic as forward).
     std::vector<float> probs(cache.logits.size());
     for (int64_t r = 0; r < N; ++r) {
         const float* row = cache.logits.data() + r * n;
@@ -415,10 +457,9 @@ mt::Tensor pool_mlp_backward(const Pool& pool,
         }
     }
 
-    // Recompute wv (weights before gate) from cached probs and top-k indices
-    // We need idx and wv — recompute top-k from cached probs
-    std::vector<float> wv(static_cast<size_t>(N) * k);
+    // Recompute top-k selection (deterministic given cached logits).
     std::vector<int64_t> idx(static_cast<size_t>(N) * k);
+    std::vector<float> psel(static_cast<size_t>(N) * k);
     for (int64_t r = 0; r < N; ++r) {
         std::vector<std::pair<float, int>> cand(n);
         for (int c = 0; c < n; ++c) {
@@ -430,168 +471,213 @@ mt::Tensor pool_mlp_backward(const Pool& pool,
                               return a.second < b.second;
                           });
         for (int i = 0; i < k; ++i) {
-            wv[static_cast<size_t>(r) * k + i] = cand[i].first;
             idx[static_cast<size_t>(r) * k + i] = cand[i].second;
+            psel[static_cast<size_t>(r) * k + i] = cand[i].first;
         }
     }
 
-    // Apply gate normalization and gate
-    const float* rw = router_w.ptr<float>();
-    const float* dp = depth_emb.ptr<float>();
-
+    // Normalization sums S[r] and normalized weights nrm (mirror forward:
+    // divide only when S != 0, then gate-scale).
+    std::vector<float> ssum(static_cast<size_t>(N), 0.0f);
+    std::vector<float> nrm(static_cast<size_t>(N) * k, 0.0f);
     for (int64_t r = 0; r < N; ++r) {
         double sum = 0.0;
+        for (int i = 0; i < k; ++i) sum += psel[static_cast<size_t>(r) * k + i];
+        ssum[r] = static_cast<float>(sum);
         for (int i = 0; i < k; ++i) {
-            sum += wv[static_cast<size_t>(r) * k + i];
-        }
-        for (int i = 0; i < k; ++i) {
-            float w = wv[static_cast<size_t>(r) * k + i];
-            if (sum != 0.0) w = static_cast<float>(w / sum);
-            int64_t sl = idx[static_cast<size_t>(r) * k + i];
-            wv[static_cast<size_t>(r) * k + i] = w * gp[rows[sl]];
+            float p = psel[static_cast<size_t>(r) * k + i];
+            nrm[static_cast<size_t>(r) * k + i] =
+                (sum != 0.0) ? static_cast<float>(p / sum) : p;
         }
     }
 
-    // Now we have the final weights (wv) and assignments (idx)
-    // d_output [N, D]
-    const float* dop = d_output.ptr<float>();
+    // kept[r][slot] lookup from the forward cache.
+    std::vector<std::vector<char>> kept(static_cast<size_t>(N),
+                                        std::vector<char>(static_cast<size_t>(n), 0));
+    for (const auto& a : cache.kept) {
+        if (a.token >= 0 && a.token < N && a.slot >= 0 && a.slot < n) {
+            kept[static_cast<size_t>(a.token)][static_cast<size_t>(a.slot)] = 1;
+        }
+    }
 
-    // d_x [N, D]: gradient through scatter-add
-    mt::Shape dxs; dxs.rank = 2; dxs.d[0] = static_cast<int>(N); dxs.d[1] = D;
+    // Outputs.
+    mt::Shape dxs;
+    dxs.rank = 2;
+    dxs.d[0] = N;
+    dxs.d[1] = D;
     mt::Tensor d_x = mt::make(dxs, mt::DType::FP32, 0.0f);
     float* dxp = d_x.ptr<float>();
-
-    // Accumulate d_x from kept assignments
-    // For each kept assignment (token=t, slot=s, weight=w):
-    //   d_x[t] += w * d_expert_input  where d_expert_input = backprop through SwiGLU + matmul
-    //   d_router_w += ...
-
-    // Group kept assignments by token for efficient d_x and d_router accumulation
-    // Also group by slot for expert backward
-    std::vector<std::vector<std::pair<int, float>>> slot_items(static_cast<size_t>(n));
-    for (const auto& a : cache.kept) {
-        slot_items[static_cast<size_t>(a.slot)].emplace_back(static_cast<int>(a.token), a.weight);
-    }
-
-    const float* w1p = pool.w1().ptr<float>();
-    const float* w3p = pool.w3().ptr<float>();
-    const float* w2p = pool.w2().ptr<float>();
-
-    // d_router_w [n_experts, D] and d_depth_emb [D]
     mt::Tensor d_rw;
     {
-        mt::Shape s; s.rank = 2; s.d[0] = ne; s.d[1] = D;
+        mt::Shape s;
+        s.rank = 2;
+        s.d[0] = ne;
+        s.d[1] = D;
         d_rw = mt::make(s, mt::DType::FP32, 0.0f);
     }
     mt::Tensor d_de;
     {
-        mt::Shape s; s.rank = 1; s.d[0] = D;
+        mt::Shape s;
+        s.rank = 1;
+        s.d[0] = D;
         d_de = mt::make(s, mt::DType::FP32, 0.0f);
+    }
+    mt::Tensor d_e1, d_e3, d_e2, d_g;
+    {
+        mt::Shape s;
+        s.rank = 3;
+        s.d[0] = n;
+        s.d[1] = dff;
+        s.d[2] = D;
+        d_e1 = mt::make(s, mt::DType::FP32, 0.0f);
+        d_e3 = mt::make(s, mt::DType::FP32, 0.0f);
+        s.d[1] = D;
+        s.d[2] = dff;
+        d_e2 = mt::make(s, mt::DType::FP32, 0.0f);
+    }
+    {
+        mt::Shape s;
+        s.rank = 1;
+        s.d[0] = ne;
+        d_g = mt::make(s, mt::DType::FP32, 0.0f);
     }
     float* drwp = d_rw.ptr<float>();
     float* ddep = d_de.ptr<float>();
+    float* dw1p = d_e1.ptr<float>();
+    float* dw3p = d_e3.ptr<float>();
+    float* dw2p = d_e2.ptr<float>();
+    float* dgp = d_g.ptr<float>();
 
-    // For each slot, compute expert activations backward
-    for (int s = 0; s < n; ++s) {
-        const auto& items = slot_items[static_cast<size_t>(s)];
-        int cs = static_cast<int>(items.size());
-        if (cs == 0) continue;
-
-        // Gather x_input [cs, D] from x_shifted
-        std::vector<float> x_in(static_cast<size_t>(cs) * D);
-        for (int i = 0; i < cs; ++i) {
-            int t = items[i].first;
-            std::memcpy(x_in.data() + i * D, xp + static_cast<size_t>(t) * D,
-                        D * sizeof(float));
-        }
-
-        // Compute a1 [cs, dff] = x @ W1^T and a3 [cs, dff] = x @ W3^T
-        // W1[s, f, :] = w1p[s*dff*D + f*D]
-        std::vector<float> a1(static_cast<size_t>(cs) * dff, 0.0f);
-        std::vector<float> a3(static_cast<size_t>(cs) * dff, 0.0f);
-        for (int i = 0; i < cs; ++i) {
-            const float* xr = x_in.data() + i * D;
-            for (int f = 0; f < dff; ++f) {
-                double s1 = 0.0, s3 = 0.0;
-                const float* r1 = w1p + (static_cast<size_t>(s) * dff + f) * D;
-                const float* r3 = w3p + (static_cast<size_t>(s) * dff + f) * D;
-                for (int dd = 0; dd < D; ++dd) {
-                    double xv = xr[dd];
-                    s1 += xv * r1[dd];
-                    s3 += xv * r3[dd];
+    // Per-row router/gate backward, then per-item expert backward.
+    std::vector<float> dlogits(static_cast<size_t>(n), 0.0f);
+    for (int64_t r = 0; r < N; ++r) {
+        const float S = ssum[static_cast<size_t>(r)];
+        // d_nrm per rank (kept ranks only; dropped carry 0).
+        std::vector<float> dnrm(static_cast<size_t>(k), 0.0f);
+        // y/dw per kept rank need expert eval; do it inline per rank.
+        for (int i = 0; i < k; ++i) {
+            const int c = static_cast<int>(idx[static_cast<size_t>(r) * k + i]);
+            if (!kept[static_cast<size_t>(r)][static_cast<size_t>(c)]) continue;
+            const int e = rows[c];
+            // expert output y for token r with slot c weights, evaluated at
+            // the RAW input (forward feeds experts x, not x_shifted)
+            const float* xr = xraw.data() + static_cast<size_t>(r) * D;
+            double dw = 0.0;
+            {
+                std::vector<float> yv(D, 0.0f);
+                for (int64_t f = 0; f < dff; ++f) {
+                    double a1 = 0.0, a3 = 0.0;
+                    const float* r1 = w1p + (static_cast<size_t>(c) * dff + f) * D;
+                    const float* r3 = w3p + (static_cast<size_t>(c) * dff + f) * D;
+                    for (int dd = 0; dd < D; ++dd) {
+                        a1 += static_cast<double>(xr[dd]) * r1[dd];
+                        a3 += static_cast<double>(xr[dd]) * r3[dd];
+                    }
+                    const float h = silu1(static_cast<float>(a1)) * static_cast<float>(a3);
+                    for (int64_t dd = 0; dd < D; ++dd) {
+                        yv[dd] += h * w2p[(static_cast<size_t>(c) * D + dd) * dff + f];
+                    }
                 }
-                a1[i * dff + f] = static_cast<float>(s1);
-                a3[i * dff + f] = static_cast<float>(s3);
+                const float* dol = dop + static_cast<size_t>(r) * D;
+                for (int dd = 0; dd < D; ++dd) dw += static_cast<double>(dol[dd]) * yv[dd];
             }
+            const float ni = nrm[static_cast<size_t>(r) * k + i];
+            dgp[e] += static_cast<float>(dw * ni);
+            dnrm[static_cast<size_t>(i)] = static_cast<float>(dw * gp[e]);
         }
-
-        // h = silu(a1) * a3
-        std::vector<float> h(static_cast<size_t>(cs) * dff);
-        for (int i = 0; i < cs; ++i) {
-            for (int f = 0; f < dff; ++f) {
-                h[i * dff + f] = silu1(a1[i * dff + f]) * a3[i * dff + f];
-            }
+        // normalization Jacobian: d_p[i] = (dnrm[i]*S - C)/S^2, C = sum dnrm*p
+        double C = 0.0;
+        for (int i = 0; i < k; ++i) {
+            C += static_cast<double>(dnrm[static_cast<size_t>(i)]) *
+                 psel[static_cast<size_t>(r) * k + i];
         }
-
-        // d_h[f] = w * sum_d d_output[t, d] * W2[s, d, f]
-        std::vector<float> d_h(dff, 0.0f);
-        for (int i = 0; i < cs; ++i) {
-            int t = items[i].first;
-            float w = items[i].second;
-            if (w == 0.0f) continue;
-            const float* dol = dop + static_cast<size_t>(t) * D;
-            for (int f = 0; f < dff; ++f) {
-                double acc = 0.0;
-                for (int dd = 0; dd < D; ++dd) {
-                    // W2[s, dd, f] = w2p[s*D*dff + dd*dff + f]
-                    const float* w2rf = w2p + (static_cast<size_t>(s) * D + dd) * dff + f;
-                    acc += static_cast<double>(dol[dd]) * (*w2rf);
-                }
-                d_h[f] += static_cast<float>(w * acc);
-            }
+        std::vector<float> dp(static_cast<size_t>(k), 0.0f);
+        for (int i = 0; i < k; ++i) {
+            const float dni = dnrm[static_cast<size_t>(i)];
+            dp[i] = (S != 0.0f) ? static_cast<float>((dni * S - C) / (S * S)) : 0.0f;
         }
-
-        // SwiGLU backward for each item:
-        // h[f] = silu(a1[f]) * a3[f]
-        // d_a1[f] = d_h[f] * a3[f] * silu'(a1[f])
-        // d_a3[f] = d_h[f] * silu(a1[f])
-        // d_x[d] = sum_f (d_a1[f] * W1[s,f,d] + d_a3[f] * W3[s,f,d])
-        for (int i = 0; i < cs; ++i) {
-            int t = items[i].first;
-            float w = items[i].second;
-            if (w == 0.0f) continue;
-
-            const float* xr = x_in.data() + i * D;
-            float* dxrow = dxp + static_cast<size_t>(t) * D;
-
-            // Router gradient
-            int expert_id = rows[s];
+        // softmax Jacobian over all n slots (non-selected carry d_p = 0)
+        double G = 0.0;
+        for (int i = 0; i < k; ++i) {
+            const int c = static_cast<int>(idx[static_cast<size_t>(r) * k + i]);
+            G += static_cast<double>(dp[i]) * probs[static_cast<size_t>(r) * n + c];
+        }
+        // softmax Jacobian over all n slots. Non-selected slots carry
+        // d_p = 0 but still get -p_c*G (their prob shifts the whole row).
+        // Zeroing them instead would silently drop router grads for every
+        // expert outside the top-k.
+        std::vector<int> rank_of(static_cast<size_t>(n), -1);
+        for (int i = 0; i < k; ++i) {
+            rank_of[static_cast<size_t>(idx[static_cast<size_t>(r) * k + i])] = i;
+        }
+        for (int c = 0; c < n; ++c) {
+            const int ri = rank_of[static_cast<size_t>(c)];
+            const float dpc = (ri >= 0) ? dp[static_cast<size_t>(ri)] : 0.0f;
+            dlogits[c] = probs[static_cast<size_t>(r) * n + c] *
+                         static_cast<float>(static_cast<double>(dpc) - G);
+        }
+        // logits[r,c] = x_shifted[r] . router_w[rows[c]]
+        const float* xr = xp + static_cast<size_t>(r) * D;
+        for (int c = 0; c < n; ++c) {
+            if (dlogits[c] == 0.0f) continue;
+            const int e = rows[c];
+            const float* wrow = rw + static_cast<size_t>(e) * D;
+            float* dr = drwp + static_cast<size_t>(e) * D;
             for (int dd = 0; dd < D; ++dd) {
-                // d_x[d]
-                double acc = 0.0;
-                for (int f = 0; f < dff; ++f) {
-                    float sa1 = silu1(a1[i * dff + f]);
-                    float sd = sa1 + (1.0f - sa1) * a1[i * dff + f];
-                    float da1 = d_h[f] * a3[i * dff + f] * sd;
-                    float da3 = d_h[f] * sa1;
-                    const float* w1r = w1p + (static_cast<size_t>(s) * dff + f) * D;
-                    const float* w3r = w3p + (static_cast<size_t>(s) * dff + f) * D;
-                    acc += da1 * w1r[dd] + da3 * w3r[dd];
-                }
-                dxrow[dd] += static_cast<float>(acc);
+                dr[dd] += dlogits[c] * xr[dd];
+                dxp[static_cast<size_t>(r) * D + dd] += dlogits[c] * wrow[dd];
+                ddep[dd] += dlogits[c] * wrow[dd];
             }
+        }
 
-            // d_router_w[expert_id, d] += d_output[t] * x_shifted / w (simplified)
-            const float* dol = dop + static_cast<size_t>(t) * D;
-            for (int dd = 0; dd < D; ++dd) {
-                drwp[static_cast<size_t>(expert_id) * D + dd] +=
-                    static_cast<float>(dol[dd]) * xr[dd] / w;
+        // Expert backward for kept ranks with nonzero weight.
+        for (int i = 0; i < k; ++i) {
+            const int c = static_cast<int>(idx[static_cast<size_t>(r) * k + i]);
+            if (!kept[static_cast<size_t>(r)][static_cast<size_t>(c)]) continue;
+            const float w = nrm[static_cast<size_t>(r) * k + i] * gp[rows[c]];
+            if (w == 0.0f) continue;
+            const float* xrow = xraw.data() + static_cast<size_t>(r) * D;
+            const float* dol = dop + static_cast<size_t>(r) * D;
+            float* dxrow = dxp + static_cast<size_t>(r) * D;
+            for (int64_t f = 0; f < dff; ++f) {
+                double a1 = 0.0, a3 = 0.0;
+                const float* r1 = w1p + (static_cast<size_t>(c) * dff + f) * D;
+                const float* r3 = w3p + (static_cast<size_t>(c) * dff + f) * D;
+                for (int dd = 0; dd < D; ++dd) {
+                    a1 += static_cast<double>(xrow[dd]) * r1[dd];
+                    a3 += static_cast<double>(xrow[dd]) * r3[dd];
+                }
+                const float a1f = static_cast<float>(a1);
+                const float a3f = static_cast<float>(a3);
+                const float s1 = silu1(a1f);
+                const float sd = silu_deriv1(a1f);
+                // dy = w * dout; dh = dy . W2; da1 = dh*a3*sd; da3 = dh*s1
+                double dh = 0.0;
+                for (int64_t dd = 0; dd < D; ++dd) {
+                    dh += static_cast<double>(w * dol[dd]) *
+                          w2p[(static_cast<size_t>(c) * D + dd) * dff + f];
+                }
+                const double da1 = dh * a3f * sd;
+                const double da3 = dh * s1;
+                for (int dd = 0; dd < D; ++dd) {
+                    dxrow[dd] += static_cast<float>(da1 * r1[dd] + da3 * r3[dd]);
+                    dw1p[(static_cast<size_t>(c) * dff + f) * D + dd] +=
+                        static_cast<float>(da1 * xrow[dd]);
+                    dw3p[(static_cast<size_t>(c) * dff + f) * D + dd] +=
+                        static_cast<float>(da3 * xrow[dd]);
+                    dw2p[(static_cast<size_t>(c) * D + dd) * dff + f] +=
+                        static_cast<float>(w * dol[dd] * s1 * a3f);
+                }
             }
         }
     }
 
     if (d_router_w) *d_router_w = d_rw;
     if (d_depth_emb) *d_depth_emb = d_de;
+    if (d_w1) *d_w1 = d_e1;
+    if (d_w3) *d_w3 = d_e3;
+    if (d_w2) *d_w2 = d_e2;
+    if (d_gate) *d_gate = d_g;
     return d_x;
 }
 

@@ -31,10 +31,16 @@ float normal_sample(PcgRng& rng, float mean=0.0f, float std=1.0f);
 // normal(shape, mean, std)     — Gaussian fill (matches nn.init.normal_)
 // zeros(shape)                 — zero fill (matches nn.init.zeros_)
 // eye(rows, cols)              — identity (matches torch.eye)
+// adapter(d)                   — [d, 2d] cat-mixer init [I|I] (matches
+//                               RecurCoder adapter init in minagi/recur.py:
+//                               h_new = h_prev + x at init). NOTE: init_eye(d,
+//                               2d) is NOT this (it yields [I|0], which zeroes
+//                               the x path and kills the whole forward).
 // const_tensor(shape, val)     — constant fill (matches nn.init.constant_)
 mt::Tensor init_normal(const mt::Shape& s, PcgRng& rng, float mean, float std);
 mt::Tensor init_zeros(const mt::Shape& s);
 mt::Tensor init_eye(int rows, int cols);
+mt::Tensor init_adapter(int d_model);
 mt::Tensor init_const(const mt::Shape& s, float val);
 
 }  // namespace minagi

@@ -334,7 +334,7 @@ void Coder::random_init(unsigned seed) {
     const int n_blocks = cfg_.n_prelude + cfg_.n_recur + cfg_.n_coda;
 
     tok_emb_ = init_normal(shape2(V, d), rng, 0.0f, 0.02f);
-    adapter_w_ = init_eye(d, 2 * d);
+    adapter_w_ = init_adapter(d);
     ln_f_w_ = init_const(shape1(d), 1.0f);
     halt_w_ = init_normal(shape2(1, d), rng, 0.0f, 0.01f);
     halt_b_ = init_const(shape1(1), -2.0f);
@@ -344,12 +344,21 @@ void Coder::random_init(unsigned seed) {
         auto& b = blocks_[i];
         b.ln1 = init_const(shape1(d), 1.0f);
         b.qkv = init_normal(shape2(3 * d, d), rng, 0.0f, 0.02f / std::sqrt(static_cast<float>(d)));
-        b.proj = init_const(shape2(d, d), 0.0f);
+        // proj and w2 carry the residual-stream std of 0.02 / sqrt(2*depth),
+        // where depth = n_prelude + n_recur + n_coda (minagi/recur.py:103-106).
+        // Zeroing proj instead (as this used to) kills the attention output
+        // entirely, which makes the whole recurrence a no-op on its first pass.
+        const float residual_std = 0.02f / std::sqrt(2.0f * static_cast<float>(n_blocks));
+        b.proj = init_normal(shape2(d, d), rng, 0.0f, residual_std);
         b.ln2 = init_const(shape1(d), 1.0f);
-        b.w1 = init_normal(shape2(dff, d), rng, 0.0f, 0.02f / std::sqrt(static_cast<float>(dff)));
-        b.w3 = init_normal(shape2(dff, d), rng, 0.0f, 0.02f / std::sqrt(static_cast<float>(dff)));
-        b.w2 = init_normal(shape2(d, dff), rng, 0.0f, 0.02f / std::sqrt(static_cast<float>(dff)));
-        b.router = init_const(shape2(cfg_.pool_experts, d), 0.0f);
+        b.w1 = init_normal(shape2(dff, d), rng, 0.0f, 0.02f);
+        b.w3 = init_normal(shape2(dff, d), rng, 0.0f, 0.02f);
+        b.w2 = init_normal(shape2(d, dff), rng, 0.0f, residual_std);
+        // Router must be nonzero (Python nn.Linear default ~ U(-1/sqrt(d),
+        // 1/sqrt(d))): an all-zero router ties every top-k and kills routing
+        // gradients. depth_emb stays zero per Python (nn.init.zeros_).
+        b.router = init_normal(shape2(cfg_.pool_experts, d), rng, 0.0f,
+                               1.0f / std::sqrt(static_cast<float>(d)));
         b.depth_emb = init_const(shape1(d), 0.0f);
     }
     loaded_ = true;

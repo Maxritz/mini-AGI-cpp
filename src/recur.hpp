@@ -81,7 +81,12 @@ public:
   std::vector<model::KVCache> empty_caches() const;      // n_slots fresh caches
   StepOut forward(const mt::Tensor& idx, std::vector<model::KVCache>& caches,
                   int64_t pos_offset);                   // section 6, B=1; observes the summary inside
-  int begin_segment();                                   // paged: swap_to(choose()) -> loads
+  // REQUIRED, not an optimization: a freshly constructed PagedPool has
+  // slots_ = [-1]*resident, and resident_rows() maps every -1 slot to expert 0.
+  // Until this runs, routing collapses onto one expert and every other expert's
+  // gradient is identically zero. PagedPool::mutable_w1/w2/w3 throw if called
+  // first. Runs choose() then swap_to(); returns the number of loads.
+  int begin_segment();
   void end_segment(const mt::Tensor& x);                 // paged: pool.observe(mean); kept for parity (the driver never calls it)
   const Config& cfg() const;
   paged::PagedPool* pool();

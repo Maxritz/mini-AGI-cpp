@@ -16,6 +16,7 @@
 #include <list>
 #include <map>
 #include <numeric>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -327,6 +328,24 @@ int PagedPool::n_experts() const { return n_experts_; }
 int PagedPool::n_routable() const { return resident_; }
 int PagedPool::router_rows() const { return n_experts_; }
 const std::vector<int>& PagedPool::slots() const { return slots_; }
+
+void PagedPool::assert_slots_valid(const char* who) const {
+    if (slots_valid()) return;
+    throw std::runtime_error(
+        std::string("PagedPool::") + who +
+        " called before slots were populated: the resident tensors are indexed"
+        " [slot, ...] and every slot is still -1, so routing would collapse"
+        " onto expert 0. Call Coder::begin_segment() (which runs choose() and"
+        " swap_to()) before touching resident experts.");
+}
+
+int PagedPool::expert_uid(int pos) const {
+    if (pos < 0 || pos >= n_experts_ ||
+        pos >= static_cast<int>(uid_.size())) {
+        return -1;
+    }
+    return static_cast<int>(uid_[static_cast<size_t>(pos)]);
+}
 const mt::Tensor& PagedPool::gate() const { return gate_; }
 const mt::Tensor& PagedPool::w1() const { return w1_; }
 const mt::Tensor& PagedPool::w3() const { return w3_; }
