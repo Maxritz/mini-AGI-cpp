@@ -37,11 +37,15 @@ cbuffer BwdPushConstants : register(b0)
     uint  d_model;        // model dim
     uint  d_ff;           // MLP intermediate dim
     uint  stride3;        // 3 * d_model
+    uint  total_kept;     // kept assignments after capacity drop (scatter-add)
     float eps;            // epsilon for RMSNorm
     float inv_sqrt_hd;    // 1/sqrt(hd) for attention scaling
     uint  pad0;
     uint  pad1;
 };
+
+// Alias: backward kernels use bare D / total_kept for the scatter-add shape.
+#define D d_model
 
 // Storage buffers (all ByteAddressBuffer for read, RWByteAddressBuffer for write)
 // binding 0: activation / grad buffers
