@@ -7,8 +7,9 @@
 // autograd graph), so BackwardCache stores intermediate activations needed for
 // gradient computation.
 //
-// The DX12 backward shaders (dx12_dense.cpp etc.) are for future GPU training;
-// this CPU path matches the CPU forward in recur.cpp.
+// The DX12 backward shaders (src/shaders/backward.hlsl + dx12_dense.cpp)
+// mirror this CPU path for GPU training; both are validated and gap #10/#11
+// are closed. This CPU path matches the forward in recur.cpp.
 #pragma once
 #include "tensor.hpp"
 #include "recur.hpp"
