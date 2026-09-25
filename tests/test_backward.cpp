@@ -254,6 +254,48 @@ void check_halting_scaling(const minagi::Config& base_cfg,
                       1e-5 * std::fabs(expect_last) + 1e-9);
         }
 
+        // P1 invariant: the cached per-step d_lam[n][t] must sum (over t) to the
+        // analytic recursion's per-row total derivative, recomputed in double from
+        // the cached lam/ce. For the LAST row, dc carried in from the row above is
+        // 0, so its closed form is unambiguous. The missing-1/M defect made this
+        // sum off by exactly M (rel ~ 1 - 1/M), so it is a batch-size-
+        // discriminating, float32-free sanity gate on the recursion's normalization.
+        for (int n : {N - 1}) {
+            double sum_lib = 0.0;
+            for (int t = 0; t < M; ++t) {
+                sum_lib += (double)an[static_cast<size_t>(n)][(size_t)t];
+            }
+            // Reproduce backward.cpp's per-row backward pass in double for row n.
+            // dc is initialized once (zero) and CARRIES ACROSS ROWS but NOT across
+            // steps t within a row: dc_prev[t] = ce[t]*lam[t] + dc[t]*(1-lam[t]),
+            // then dc = dc_prev. cum_prev is PER-STEP (cum_prev[t] = prod over rows
+            // k<n of (1-lam[k][t])), NOT a single scalar flowing across t.
+            std::vector<double> cum_prev(static_cast<size_t>(M), 1.0);
+            for (int nn = 0; nn < n; ++nn) {
+                for (int t = 0; t < M; ++t) {
+                    cum_prev[static_cast<size_t>(t)] *=
+                        (1.0 - (double)bc.lam_per_step[static_cast<size_t>(nn)].atf(t));
+                }
+            }
+            std::vector<double> dc(static_cast<size_t>(M), 0.0);
+            double sum_analytic = 0.0;
+            for (int step = 0; step < M; ++step) {
+                double lam_nt = bc.lam_per_step[static_cast<size_t>(n)].atf(step);
+                double ce_nt = ce_of(n, step) / (double)M;
+                sum_analytic += cum_prev[static_cast<size_t>(step)] *
+                                (ce_nt - dc[static_cast<size_t>(step)]);
+                dc[static_cast<size_t>(step)] = ce_nt * lam_nt +
+                    dc[static_cast<size_t>(step)] * (1.0 - lam_nt);
+            }
+            const double rel = (sum_analytic != 0.0)
+                ? std::fabs(sum_lib / sum_analytic - 1.0) : 0.0;
+            std::cout << "  sum_inv M=" << M << " n=" << n
+                      << " lib=" << sum_lib << " analytic=" << sum_analytic
+                      << " rel=" << rel << "\n";
+            check("halting_sum_consistency_M" + std::to_string(M) + "_n" + std::to_string(n),
+                  rel < 1e-3);
+        }
+
         const double e = 1e-6;
         for (int n = 0; n < N; ++n) {
             std::vector<double> lam0(static_cast<size_t>(N));
